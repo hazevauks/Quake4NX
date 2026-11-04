@@ -1,0 +1,30 @@
+# The menu, then the game itself: the HUD, weapons, a save and a load, on a map with no opening cinematic.
+150 shot 01_menu
+155 stats menu
+200 cmd map game/building_b
+400 shot 02_game
+405 stats game
+420 cmd god
+425 cmd give all
+440 press ZR
+470 release ZR
+498 cmd r_dkLogDraws 1
+500 shot 03_firing
+502 cmd r_dkLogDraws 0
+505 stats firing
+520 stick L 0 32767
+600 stick L 0 0
+620 stick R 16000 0
+660 stick R 0 0
+700 shot 04_moved
+720 press RIGHT
+722 release RIGHT
+800 shot 05_next_weapon
+820 cmd savegame hostcheck
+1000 cmd loadgame hostcheck
+1200 shot 06_loaded
+1205 stats loaded
+1300 press PLUS
+1302 release PLUS
+1400 shot 07_pause_menu
+1500 quit

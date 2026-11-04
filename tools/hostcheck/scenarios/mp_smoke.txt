@@ -1,0 +1,11 @@
+# The multiplayer module: a local server on the first arena, and the HUD.
+100 cmd si_map mp/q4dm1
+105 cmd si_gameType DM
+110 cmd spawnServer
+400 shot 01_mp
+405 stats mp
+500 press ZR
+520 release ZR
+700 shot 02_mp_spawned
+705 stats mp_spawned
+800 quit

@@ -1,0 +1,26 @@
+# The main menu, the first map, a look around with the controller, a save and a load.
+30 shot 01_menu
+35 stats menu
+60 cmd map game/airdefense1
+# frames count only once presented, so the load itself takes none
+200 shot 02_map
+205 stats map
+# the opening cinematic, skipped
+230 press PLUS
+232 release PLUS
+260 press ZR
+290 release ZR
+320 stick L 0 32767
+420 stick L 0 0
+440 stick R 16000 0
+480 stick R 0 0
+520 shot 03_moved
+525 stats moved
+560 press RIGHT
+562 release RIGHT
+620 shot 04_next_weapon
+660 cmd savegame hostcheck
+760 cmd loadgame hostcheck
+900 shot 05_loaded
+905 stats loaded
+960 quit
