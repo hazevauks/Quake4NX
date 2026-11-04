@@ -103,6 +103,10 @@ bool ParsePath(const std::string& input, Path& path, std::string& error) {
     const bool unc = normalized.size() > 4 && normalized[0] == '/' && normalized[1] == '/';
     if (!drive && !unc) return Error(error,"Path must be absolute");
     root = drive ? 3 : 2;
+#elif defined(__SWITCH__)
+    const auto device = normalized.find(":/");
+    if (device == std::string::npos) return Error(error,"Path must be absolute");
+    root = device + 2;
 #else
     if (normalized[0] != '/') return Error(error,"Path must be absolute");
 #endif
@@ -281,6 +285,7 @@ std::string TempLeaf() {
         std::to_string(tempSequence.fetch_add(1,std::memory_order_relaxed)) + ".tmp";
 }
 
+#ifndef __SWITCH__
 #ifndef _WIN32
 bool OpenParent(const Path& path, Handle& parent, std::string& error, bool* missing = nullptr) {
     parent.value = open(path.parent.c_str(),O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -364,6 +369,7 @@ bool InspectTarget(const Path& path, Native parent, bool& missing, std::string& 
     return true;
 #endif
 }
+#endif // !__SWITCH__
 
 DurableReadResult Read(const Path& path, std::size_t budget, std::string& out, std::string& error) {
     if (Fail(Point::OpenRead)) { Error(error,"File open failed (injected)"); return DurableReadResult::Failed; }
@@ -400,6 +406,90 @@ DurableReadResult Read(const Path& path, std::size_t budget, std::string& out, s
     if (!file.Close(error,Point::CloseRead)) return DurableReadResult::Failed;
     out.swap(candidate); error.clear(); return DurableReadResult::Present;
 }
+
+#ifdef __SWITCH__
+/*
+Horizon's file system has no directory handles, *at calls or hard links, and its
+rename refuses to replace a file. So these work on full paths. A new file is written
+beside the target and swapped in at the end: the one moment both exist under other
+names is covered by the previous file staying until the new one has its name.
+*/
+bool TargetMissing(const std::string& full, bool& missing, std::string& error) {
+    struct stat info{};
+    missing = false;
+    if (stat(full.c_str(),&info) != 0) {
+        if (errno == ENOENT) { missing = true; return true; }
+        return Error(error,"Cannot inspect target",errno);
+    }
+    if (!S_ISREG(info.st_mode)) return Error(error,"Target is not a regular file");
+    return true;
+}
+
+bool WriteBeside(const Path& path, const std::string& bytes, std::string& temp, std::string& error) {
+    temp = path.parent + "/" + TempLeaf();
+    Handle file(open(temp.c_str(),O_RDWR | O_CREAT | O_TRUNC,0600));
+    if (file.value == Invalid) return Error(error,"Temporary file creation failed",errno);
+    if (!WriteAll(file.value,bytes,error)) { file.Close(error,Point::CloseWrite); unlink(temp.c_str()); return false; }
+    fsync(file.value);
+    if (!file.Close(error,Point::CloseWrite)) { unlink(temp.c_str()); return false; }
+    return true;
+}
+
+bool Replace(const Path& path, const std::string& bytes, std::string& error) {
+    bool missing;
+    if (!TargetMissing(path.full,missing,error)) return false;
+    std::string temp;
+    if (!WriteBeside(path,bytes,temp,error)) return false;
+    const std::string previous = path.full + ".previous";
+    if (!missing) {
+        unlink(previous.c_str());
+        if (rename(path.full.c_str(),previous.c_str()) != 0) { unlink(temp.c_str()); return Error(error,"Replacement rename failed",errno); }
+    }
+    if (rename(temp.c_str(),path.full.c_str()) != 0) {
+        const int code = errno;
+        if (!missing) rename(previous.c_str(),path.full.c_str());
+        unlink(temp.c_str());
+        return Error(error,"Replacement rename failed",code);
+    }
+    if (!missing) unlink(previous.c_str());
+    error.clear(); return true;
+}
+
+DurableCreateResult Create(const Path& path, const std::string& bytes, std::string& error) {
+    bool missing;
+    if (!TargetMissing(path.full,missing,error)) return DurableCreateResult::Failed;
+    if (!missing) { error.clear(); return DurableCreateResult::Exists; }
+    std::string temp;
+    if (!WriteBeside(path,bytes,temp,error)) return DurableCreateResult::Failed;
+    if (rename(temp.c_str(),path.full.c_str()) != 0) {
+        const int code = errno;
+        unlink(temp.c_str());
+        Error(error,"New-file publication failed",code);
+        return DurableCreateResult::Failed;
+    }
+    error.clear(); return DurableCreateResult::Created;
+}
+
+bool Remove(const Path& path, std::string& error) {
+    bool missing;
+    if (!TargetMissing(path.full,missing,error)) return false;
+    if (!missing && unlink(path.full.c_str()) != 0) return Error(error,"Removal failed",errno);
+    error.clear(); return true;
+}
+
+bool Move(const Path& from, const Path& to, bool& moved, std::string& error) {
+    moved = false;
+    if (from.parent != to.parent) return Error(error,"Durable move must stay within one directory");
+    bool missing;
+    if (!TargetMissing(from.full,missing,error)) return false;
+    if (missing) return Error(error,"Move source is missing");
+    if (!TargetMissing(to.full,missing,error)) return false;
+    if (!missing) return Error(error,"Move destination is occupied");
+    if (rename(from.full.c_str(),to.full.c_str()) != 0) return Error(error,"Move rename failed",errno);
+    moved = true;
+    error.clear(); return true;
+}
+#else
 
 bool Replace(const Path& path, const std::string& bytes, std::string& error) {
     Handle parent;
@@ -583,6 +673,7 @@ bool Move(const Path& from, const Path& to, bool& moved, std::string& error) {
 #endif
     error.clear(); return true;
 }
+#endif // __SWITCH__
 
 } // namespace durable_detail
 
@@ -665,7 +756,7 @@ bool DurableFileLease::TryAcquire(const std::string& path, std::string& error) {
         if (candidate->file.value == Invalid) return Error(error,"Cannot acquire durable file lease",LastError());
         std::uint64_t size;
         if (!Regular(candidate->file.value,size,error)) return false;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__SWITCH__)	// one process, on the Switch
         int result;
         do { result = flock(candidate->file.value,LOCK_EX | LOCK_NB); } while (result != 0 && errno == EINTR);
         if (result != 0) return Error(error,"Durable file lease is busy or unsupported",errno);

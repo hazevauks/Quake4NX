@@ -2618,6 +2618,10 @@ static bool Common_SettingsSaveDirectory( std::string& directory, std::string& e
 		const size_t share = root.find( '/', 2 );
 		if ( share != std::string::npos && share + 1 < root.size() ) prefix = 2;
 	}
+#elif defined( __SWITCH__ )
+	// paths start with the device's name, as in "sdmc:/"
+	const size_t device = root.find( ":/" );
+	if ( device != std::string::npos ) prefix = device + 2;
 #else
 	if ( root[0] == '/' ) prefix = 1;
 #endif

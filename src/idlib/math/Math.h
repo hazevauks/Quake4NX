@@ -37,7 +37,7 @@
 #endif
 
 // jscott: uncomment this to use id's sqrt and trig approximations
-#if defined( __linux__ ) || defined( MACOS_X )
+#if defined( __linux__ ) || defined( MACOS_X ) || defined( __SWITCH__ )
 	// TTimo - enabling for OSes I'm covering
 	// (14:34:20) mrelusive: in the general case we don't use those functions
 	// (14:34:28) mrelusive: they are only for specific cases where they are faster
@@ -936,7 +936,7 @@ ID_INLINE int idMath::FtoiFast( float f ) {
 	m = ( i & ( ( 1 << IEEE_FLT_MANTISSA_BITS ) - 1 ) ) | ( 1 << IEEE_FLT_MANTISSA_BITS );
 	shift = e - IEEE_FLT_MANTISSA_BITS;
 	return ( ( ( ( m >> -shift ) | ( m << shift ) ) & ~( e >> 31 ) ) ^ s ) - s;
-#elif defined( __linux__ )
+#elif defined( __linux__ ) || defined( __SWITCH__ )
 	#ifdef __i386__
 		int i;
 		__asm__ __volatile__ (

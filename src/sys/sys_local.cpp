@@ -304,6 +304,8 @@ void idSysLocal::DLL_GetFileName( const char *baseName, char *dllName, int maxLe
 	}
 #elif defined( MACOS_X )
 	idStr::snPrintf( dllName, maxLength, "%s.dylib", baseName );
+#elif defined( __SWITCH__ )
+	idStr::snPrintf( dllName, maxLength, "%s", baseName );
 #else
 #error OS define is required
 #endif

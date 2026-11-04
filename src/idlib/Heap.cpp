@@ -96,7 +96,7 @@ void local_free(void *ptr)
 #if !defined( RV_UNIFIED_ALLOCATOR )
 	#if defined( __APPLE__ )
 		#include <malloc/malloc.h>
-	#elif defined( __ANDROID__ ) || defined( __linux__ ) || defined( _WIN32 )
+	#elif defined( __ANDROID__ ) || defined( __linux__ ) || defined( __SWITCH__ ) || defined( _WIN32 )
 		#include <malloc.h>
 	#endif
 #endif
@@ -127,7 +127,7 @@ inline size_t local_msize( void *ptr )
 	return malloc_size( ptr );
 #elif defined( _WIN32 )
 	return _msize( ptr );
-#elif defined( __ANDROID__ ) || defined( __linux__ )
+#elif defined( __ANDROID__ ) || defined( __linux__ ) || defined( __SWITCH__ )
 	return malloc_usable_size( ptr );
 #else
 	// No portable way to recover the size: report zero so the running total

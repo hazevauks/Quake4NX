@@ -33,6 +33,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "GameDirPolicy.h"
 #include "LevelLoadCacheManager.h"
 #include "openq4_paks_generated.h"
+#ifdef __SWITCH__
+#include <sys/stat.h>
+#endif
 #include "../sys/URLPolicy.h"
 
 #include <errno.h>
@@ -1721,7 +1724,7 @@ idCVar idFileSystemLocal::fs_awakeningpath( "fs_awakeningpath", "", CVAR_SYSTEM 
 idCVar	idFileSystemLocal::fs_cdpath( "fs_cdpath", "", CVAR_SYSTEM | CVAR_INIT, "" );
 idCVar	idFileSystemLocal::fs_game( "fs_game", OPENQ4_GAMEDIR, CVAR_SYSTEM | CVAR_INIT | CVAR_SERVERINFO, "mod path" );
 idCVar  idFileSystemLocal::fs_game_base( "fs_game_base", "", CVAR_SYSTEM | CVAR_INIT | CVAR_SERVERINFO, "alternate mod path, searched after the main fs_game path, before the basedir" );
-#ifdef WIN32
+#if defined( WIN32 ) || defined( __SWITCH__ )
 idCVar	idFileSystemLocal::fs_caseSensitiveOS( "fs_caseSensitiveOS", "0", CVAR_SYSTEM | CVAR_BOOL, "" );
 #else
 idCVar	idFileSystemLocal::fs_caseSensitiveOS( "fs_caseSensitiveOS", "1", CVAR_SYSTEM | CVAR_BOOL, "" );
@@ -2148,6 +2151,44 @@ bool idFileSystemLocal::FilenameCompare( const char *s1, const char *s2 ) const 
 	return false;		// strings are equal
 }
 
+#ifdef __SWITCH__
+/*
+===============================================================================
+
+Every lookup tries each search path's directory on the card before the pk4s, and most of
+those tries fail, because the file is in a pk4. Each is a slow file system round trip,
+repeated for thousands of files per map. This remembers, per directory, whether
+it exists. It is cleared whenever the file system writes a file or makes a directory.
+
+===============================================================================
+*/
+static idHashTable<bool> fsDirExists;
+
+static void FS_ClearDirCache( void ) {
+	Sys_EnterCriticalSection( CRITICAL_SECTION_THREE );
+	fsDirExists.Clear();
+	Sys_LeaveCriticalSection( CRITICAL_SECTION_THREE );
+}
+
+// 1 exists, 0 missing, -1 unknown
+static int FS_LookupDirCache( const char *dir ) {
+	bool *exists = NULL;
+	int result = -1;
+	Sys_EnterCriticalSection( CRITICAL_SECTION_THREE );
+	if ( fsDirExists.Get( dir, &exists ) && exists ) {
+		result = *exists ? 1 : 0;
+	}
+	Sys_LeaveCriticalSection( CRITICAL_SECTION_THREE );
+	return result;
+}
+
+static void FS_StoreDirCache( const char *dir, bool exists ) {
+	Sys_EnterCriticalSection( CRITICAL_SECTION_THREE );
+	fsDirExists.Set( dir, exists );
+	Sys_LeaveCriticalSection( CRITICAL_SECTION_THREE );
+}
+#endif
+
 /*
 ================
 idFileSystemLocal::OpenOSFile
@@ -2160,7 +2201,22 @@ FILE *idFileSystemLocal::OpenOSFile( const char *fileName, const char *mode, idS
 	idStr fpath, entry;
 	idStrList list;
 
-#ifndef __MWERKS__
+#ifdef __SWITCH__
+	const bool readOnly = mode[0] == 'r' && strchr( mode, '+' ) == NULL;
+	idStr dirPath;
+	if ( readOnly ) {
+		dirPath = fileName;
+		dirPath.StripFilename();
+		if ( FS_LookupDirCache( dirPath ) == 0 ) {
+			return NULL;
+		}
+	} else {
+		// a write may create the file
+		FS_ClearDirCache();
+	}
+#endif
+
+#if !defined( __MWERKS__ ) && !defined( __SWITCH__ )
 #ifndef WIN32 
 	// some systems will let you fopen a directory
 	struct stat buf;
@@ -2170,6 +2226,19 @@ FILE *idFileSystemLocal::OpenOSFile( const char *fileName, const char *mode, idS
 #endif
 #endif
 	fp = fopen( fileName, mode );
+#ifdef __SWITCH__
+	if ( fp ) {
+		setvbuf( fp, NULL, _IOFBF, SWITCH_STDIO_BUFFER_BYTES );
+	}
+	if ( readOnly && dirPath.Length() && FS_LookupDirCache( dirPath ) == -1 ) {
+		bool dirExists = fp != NULL;
+		if ( !dirExists ) {
+			struct stat dirBuf;
+			dirExists = stat( dirPath, &dirBuf ) == 0;
+		}
+		FS_StoreDirCache( dirPath, dirExists );
+	}
+#endif
 	if ( !fp && fs_caseSensitiveOS.GetBool() ) {
 		idStr resolvedFileName;
 		if ( ResolveCaseInsensitiveOSPath( fileName, resolvedFileName, true ) ) {
@@ -2265,6 +2334,9 @@ Creates any directories needed to store the given filename
 ============
 */
 void idFileSystemLocal::CreateOSPath( const char *OSPath ) {
+#ifdef __SWITCH__
+	FS_ClearDirCache();
+#endif
 	char	*ofs;
 	
 	// make absolutely sure that it can't back up the path
@@ -3130,6 +3202,10 @@ bool idFileSystemLocal::PromoteFile( const char *stagedRelativePath,
 			stagedRelativePath, finalRelativePath, static_cast<unsigned long>( GetLastError() ) );
 	}
 #else
+#ifdef __SWITCH__
+	// rename does not replace on the SD card
+	remove( finalOS.c_str() );
+#endif
 	promoted = rename( stagedOS.c_str(), finalOS.c_str() ) == 0;
 	if ( !promoted ) {
 		common->Warning( "Could not atomically promote '%s' to '%s' (error %d)",
@@ -6012,6 +6088,15 @@ idFileSystemLocal::ValidateOpenQ4Paks
 ================
 */
 bool idFileSystemLocal::ValidateOpenQ4Paks( idStr &errors ) {
+#ifdef __SWITCH__
+	// tools/make_sd.py wrote it; reading it back would slow every start. pak1 is not used here: docs/architecture.md
+	errors.Clear();
+	if ( !FindGamePackByName( "pak0.pk4", OPENQ4_GAMEDIR ) ) {
+		errors += va( "missing %s/pak0.pk4\n", OPENQ4_GAMEDIR );
+		return false;
+	}
+	return true;
+#endif
 	struct expectedOpenQ4Pak_t {
 		const char *name;
 		const char *md5;
@@ -8406,6 +8491,19 @@ void idFileSystemLocal::FindDLL( const char *name, char _dllPath[ MAX_OSPATH ], 
 	gameModuleOrigin_t resolvedOrigin = GAME_MODULE_ORIGIN_NONE;
 
 	sys->DLL_GetFileName( name, dllName, MAX_OSPATH );
+
+#ifdef __SWITCH__
+	// the game modules are part of the executable (cmake/Q4GameObject.cmake): there is no file to find
+	if ( idStr::Icmpn( dllName, "game", 4 ) == 0 ) {
+		idStr::Copynz( _dllPath, dllName, MAX_OSPATH );
+		if ( updateChecksum ) {
+			gameDLLChecksum = 0;
+			gamePakChecksum = 0;
+			gameModuleOrigin = GAME_MODULE_ORIGIN_PACKAGE_ROOT;
+		}
+		return;
+	}
+#endif
 
 	idStr exeDir = Sys_EXEPath();
 	exeDir.StripFilename();

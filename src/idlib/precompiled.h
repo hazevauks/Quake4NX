@@ -133,21 +133,30 @@ public:
 
 #endif // _WINDOWS
 
-#ifdef __linux__
+#if defined( __linux__ ) || defined( __SWITCH__ )
 
 // for offsetof
 #include <stddef.h>
 // FLT_MAX and such
 #include <limits.h>
 #include <float.h>
+// newlib defines _LITTLE_ENDIAN with a value and compares it, so it must come first
+#include <sys/types.h>
 
+	#ifndef __SWITCH__
 	#define __WITH_PB__
+	#endif
 	#undef WIN32
 	#undef _XBOX
 	#undef _CONSOLE
 	#define _OPENGL
+	#ifndef _LITTLE_ENDIAN
 	#define _LITTLE_ENDIAN
+	#endif
+	// the SD card's file systems do not care about case
+	#ifndef __SWITCH__
 	#define _CASE_SENSITIVE_FILESYSTEM
+	#endif
 	#define _USE_OPENAL
 	#ifndef Q4SDK
 		#define Q4SDK_MD5R

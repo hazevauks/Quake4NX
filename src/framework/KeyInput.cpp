@@ -205,7 +205,11 @@ enum keyInputFamily_t {
 	KEY_INPUT_FAMILY_CONTROLLER
 };
 
+#ifdef __SWITCH__
+static keyInputFamily_t key_lastInputFamily = KEY_INPUT_FAMILY_CONTROLLER;	// there is nothing else to press
+#else
 static keyInputFamily_t key_lastInputFamily = KEY_INPUT_FAMILY_DESKTOP;
+#endif
 static bool key_lastPointerTouch = false;
 
 static bool Key_IsValidKeyNum( int keynum ) {

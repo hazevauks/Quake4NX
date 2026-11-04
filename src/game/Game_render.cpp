@@ -1227,6 +1227,11 @@ idGameLocal::InitGameRenderSystem
 ========================
 */
 void idGameLocal::InitGameRenderSystem(void) {
+#ifdef __SWITCH__
+	// RenderScene draws straight to the screen, so no targets are made
+	gameRender.videoRestartCount = renderSystem->GetVideoRestartCount();
+	return;
+#endif
 	ShutdownGameRenderSystem();
 
 	if ( !renderSystem->IsOpenGLRunning() ) {
@@ -1371,6 +1376,13 @@ void idGameLocal::RenderScene(const renderView_t *view, idRenderWorld *renderWor
 
 	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
 	renderSystem->SetUseUIViewportFor2D( false );
+
+#ifdef __SWITCH__
+	// straight to the screen: no offscreen scene and no post-process chain in this GPU's budget
+	openQ4_RenderSceneDirect( view, renderWorld, portalSky, renderFlags );
+	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
+	return;
+#endif
 
 	const int currentVideoRestartCount = renderSystem->GetVideoRestartCount();
 	if ( gameRender.videoRestartCount != currentVideoRestartCount ) {

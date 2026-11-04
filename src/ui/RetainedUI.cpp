@@ -24,7 +24,7 @@ extern idUserInterfaceManagerLocal uiManagerLocal;
 #include <atomic>
 #include <limits>
 #include <thread>
-#if defined(USE_SDL3)
+#if defined(USE_SDL3) || defined(__SWITCH__)
 bool Sys_SDL_IsGameWindowFocused(void);
 int Sys_SDL_GamepadGlyphFamily(int faceLabels[4]);
 #endif
@@ -2029,7 +2029,7 @@ bool RetainedUI_PromptSwapped() { return idKeyInput::MenuConfirmSwapped(); }
 int RetainedUI_PromptGlyphs() {
 	if (!idKeyInput::LastInputWasController()) return 0;
 	int family = 0;
-#if defined(USE_SDL3)
+#if defined(USE_SDL3) || defined(__SWITCH__)
 	int faces[4] = {0,0,0,0};
 	family = Sys_SDL_GamepadGlyphFamily(faces);
 #endif

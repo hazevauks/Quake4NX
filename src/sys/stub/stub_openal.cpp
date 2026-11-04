@@ -20,7 +20,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ===========================================================================
 */
 
-#if !defined( __linux__ ) || !defined( ID_DEDICATED )
+#if ( !defined( __linux__ ) || !defined( ID_DEDICATED ) ) && !defined( Q4NX_HOSTCHECK )
 	#error "stub_openal.cpp is only for Linux dedicated-server builds"
 #endif
 

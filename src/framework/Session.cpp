@@ -475,11 +475,16 @@ static inline bool Session_MoveSaveFileDurably( const std::string &from, const s
 	std::string &durabilityUnconfirmed, std::string &error ) {
 	// fs_savepath may be relative to the working directory.
 	const auto native = []( const std::string &path ) {
+#ifdef __SWITCH__
+		// always absolute here, and to std::filesystem a device name makes it relative
+		return path;
+#else
 		std::error_code code;
 		const auto absolute = std::filesystem::absolute( std::filesystem::u8path( path ), code );
 		if ( code ) return path;
 		const auto bytes = absolute.lexically_normal().u8string();
 		return std::string( reinterpret_cast<const char *>( bytes.data() ), bytes.size() );
+#endif
 	};
 	bool moved = false;
 	if ( openq4::DurableMoveExact( native( from ), native( to ), moved, error ) ) return true;

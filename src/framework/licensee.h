@@ -146,6 +146,10 @@
 	#define DEFAULT_BASE_PATH				"/usr/local/games/openq4"
 #elif defined( MACOS_X )
 	#define DEFAULT_BASE_PATH				"/Applications/openQ4"
+#elif defined( __SWITCH__ )
+	#ifndef DEFAULT_BASE_PATH		// tools/hostcheck has its own
+		#define DEFAULT_BASE_PATH			"sdmc:/switch/quake4"
+	#endif
 #endif
 
 // CD Key file info

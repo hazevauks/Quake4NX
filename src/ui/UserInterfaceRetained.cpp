@@ -27,7 +27,7 @@
 #include <optional>
 #include <set>
 
-#if defined(USE_SDL3)
+#if defined(USE_SDL3) || defined(__SWITCH__)
 bool Sys_SDL_IsGameWindowFocused(void);
 int Sys_SDL_GamepadGlyphFamily(int faceLabels[4]);
 #endif
@@ -105,7 +105,7 @@ KeyGlyph PromptGlyph(int key) {
 	}
 	// 0 generic, 1 Xbox, 2 PlayStation, 3 Nintendo, 4 Steam Deck.
 	int face[4] = {0,0,0,0}, family = 0;
-#if defined(USE_SDL3)
+#if defined(USE_SDL3) || defined(__SWITCH__)
 	family = idMath::ClampInt(0,4,Sys_SDL_GamepadGlyphFamily(face));
 #endif
 	static const char* const bumpers[5][2] = {{"L1","R1"},{"LB","RB"},{"L1","R1"},{"L","R"},{"L1","R1"}};

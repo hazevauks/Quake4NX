@@ -1248,6 +1248,9 @@ extern unzFile unzReOpen (const char* path, unzFile file)
 	FILE * fin;
 
     fin=fopen(path,"rb");
+#ifdef __SWITCH__
+    if (fin) setvbuf(fin, NULL, _IOFBF, SWITCH_STDIO_BUFFER_BYTES);
+#endif
 	if (fin==NULL)
 		return NULL;
 
@@ -1287,6 +1290,9 @@ extern unzFile unzOpen (const char* path)
 	int err=UNZ_OK;
 
     fin=fopen(path,"rb");
+#ifdef __SWITCH__
+    if (fin) setvbuf(fin, NULL, _IOFBF, SWITCH_STDIO_BUFFER_BYTES);
+#endif
 	if (fin==NULL)
 		return NULL;
 
