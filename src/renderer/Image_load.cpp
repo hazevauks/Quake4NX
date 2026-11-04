@@ -1202,6 +1202,7 @@ static bool R_BindTextureToUnit( int texUnit, GLenum target, GLuint texture ) {
 	return true;
 }
 
+#ifndef OPENQ4_RENDERER_DK
 void idImage::Bind() {
 
 	//	RENDERLOG_PRINTF( "idImage::Bind( %s )\n", GetName() );
@@ -1270,6 +1271,8 @@ void idImage::Bind() {
 	}
 
 }
+#endif
+
 
 /*
 ================
@@ -1490,6 +1493,7 @@ static void R_AllocateCopyTextureStorage( bool isCube, GLenum copyTarget,
 CopyFramebuffer
 ====================
 */
+#ifndef OPENQ4_RENDERER_DK
 bool idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight,
 		int cubeFace ) {
 	const bool isCube = opts.textureType == TT_CUBIC;
@@ -1649,12 +1653,15 @@ bool idImage::CopyFramebuffer( int x, int y, int imageWidth, int imageHeight,
 //	backEnd.pc.c_copyFrameBuffer++;
 	return true;
 }
+#endif
+
 
 /*
 ====================
 CopyDepthbuffer
 ====================
 */
+#ifndef OPENQ4_RENDERER_DK
 bool idImage::CopyDepthbuffer( int x, int y, int imageWidth, int imageHeight,
 		int cubeFace ) {
 	const bool isCube = opts.textureType == TT_CUBIC;
@@ -1890,6 +1897,8 @@ bool idImage::CopyDepthbuffer( int x, int y, int imageWidth, int imageHeight,
 	//backEnd.pc.c_copyFrameBuffer++;
 	return true;
 }
+#endif
+
 
 /*
 =============
@@ -1898,6 +1907,7 @@ RB_UploadScratchImage
 if rows = cols * 6, assume it is a cube map animation
 =============
 */
+#ifndef OPENQ4_RENDERER_DK
 void idImage::UploadScratch( const byte * data, int cols, int rows ) {
 
 	// if rows = cols * 6, assume it is a cube map animation
@@ -1938,6 +1948,8 @@ void idImage::UploadScratch( const byte * data, int cols, int rows ) {
 		SubImageUpload( 0, 0, 0, 0, opts.width, opts.height, data );
 	}
 }
+#endif
+
 
 /*
 ==================

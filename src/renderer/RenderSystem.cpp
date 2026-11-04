@@ -1108,7 +1108,7 @@ void idRenderSystemLocal::SetUseUIViewportFor2D( bool enable ) {
 		(glConfig.uiViewportX==crop.x && glConfig.vidHeight-glConfig.uiViewportY-glConfig.uiViewportHeight==crop.y &&
 		 glConfig.uiViewportWidth==crop.width && glConfig.uiViewportHeight==crop.height);
 	bool mustFlush = !sameViewport;
-#if !defined( OPENQ4_RENDERER_VK_MODULE )
+#if !defined( OPENQ4_RENDERER_DK )
 	// GL captures _currentRender at the start of the post-process range. Keep
 	// the final scene composite separate from a following legacy scope even
 	// when their rectangles match. Ordinary UI geometry can still batch.
@@ -2595,7 +2595,7 @@ static bool R_ValidateSMAALookupImage( const idImage *image, const char *imageNa
 }
 
 bool idRenderSystemLocal::ValidateSMAALookupTextures( void ) {
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 	if ( !glConfig.GLSLProgramAvailable || !glConfig.GLSL130Available ) {
 		return false;
 	}

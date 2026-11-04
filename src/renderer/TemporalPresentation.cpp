@@ -759,7 +759,7 @@ static bool R_TemporalPresentation_AutomaticTemporalAAWanted( void ) {
 #if defined( OPENQ4_RENDERER_GLES_MODULE )
 	return false;
 #else
-#if !defined( OPENQ4_RENDERER_VK_MODULE )
+#if !defined( OPENQ4_RENDERER_DK )
 	if ( !glConfig.GLSLProgramAvailable || !glConfig.GLSL130Available ) {
 		return false;
 	}
@@ -933,8 +933,6 @@ void R_TemporalPresentation_PrintStatus_f( const idCmdArgs &args ) {
 		rg_temporalOwnershipStats.reactive,
 		rg_temporalOwnershipStats.missed,
 		rg_temporalOwnershipStats.complete ? 1 : 0 );
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	extern void VK_PostProcess_PrintTemporalMotion( void );
-	VK_PostProcess_PrintTemporalMotion();
+#ifdef OPENQ4_RENDERER_DK
 #endif
 }

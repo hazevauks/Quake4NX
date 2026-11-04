@@ -26,6 +26,16 @@ If you have questions concerning this license or the applicable additional terms
 ===========================================================================
 */
 
+#include <deko3d.h>
+
+// a piece of a large GPU memory block
+typedef struct {
+	DkMemBlock	block;
+	uint32_t	offset;
+	uint32_t	size;
+	uint32_t	blockIndex;
+} dkAlloc_t;
+
 // vertex cache calls should only be made by the front end
 
 const int NUM_VERTEX_FRAMES = 2;
@@ -38,8 +48,10 @@ typedef enum {
 } vertBlockTag_t;
 
 typedef struct vertCache_s {
-	unsigned int			vbo;
-	void			*virtMem;			// only one of vbo / virtMem will be set
+	DkGpuAddr		gpuAddr;
+	dkAlloc_t		alloc;
+	unsigned int	vbo;				// always 0, for the shared files that ask
+	void			*virtMem;			// the GPU address, for the same reason
 	bool			indexBuffer;		// holds indexes instead of vertexes
 
 	int				offset;
@@ -120,10 +132,7 @@ public:
 	void			List();
 
 private:
-	void			InitMemoryBlocks( int size );
 	void			ActuallyFree( vertCache_t *block );
-	void			ReclaimHeaderList( vertCache_t *list );
-	void			ReclaimAllHeaders();
 
 	static idCVar	r_showVertexCache;
 	static idCVar	r_vertexBufferMegs;
@@ -135,24 +144,17 @@ private:
 	int				staticCountThisFrame;
 	int				dynamicAllocThisFrame;
 	int				dynamicCountThisFrame;
-	int				legacyAllocThisFrame;	// bytes used in tempBuffers[listNum]; separate from
-											// dynamicAllocThisFrame, which also counts bridged bytes
 
 	int				currentFrame;			// for purgable block tracking
-	int				listNum;				// currentFrame % NUM_VERTEX_FRAMES, determines which tempBuffers to use
+	int				listNum;				// currentFrame % NUM_VERTEX_FRAMES, determines which temp area to use
 
 	bool			virtualMemory;			// not fast stuff
 
-	bool			allocatingTempBuffer;	// force GL_STREAM_DRAW_ARB
-
-	vertCache_t		*tempBuffers[NUM_VERTEX_FRAMES];		// allocated at startup
-	bool			tempOverflow;			// had to alloc a temp in static memory
+	bool			allocatingTempBuffer;
+	bool			tempOverflow;			// the frame's temp area ran out
 
 	idBlockAlloc<vertCache_t,1024, 0>	headerAllocator;
 
-	vertCache_t		freeStaticHeaders;		// head of doubly linked list
-	vertCache_t		freeDynamicHeaders;		// head of doubly linked list
-	vertCache_t		dynamicHeaders;			// head of doubly linked list
 	vertCache_t		deferredFreeList;		// head of doubly linked list
 	vertCache_t		staticHeaders;			// head of doubly linked list in MRU order,
 											// staticHeaders.next is most recently used

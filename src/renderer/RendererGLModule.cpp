@@ -9,7 +9,7 @@
 	docs/dev/archive/2026-10-18/plans/2026-07-17-vulkan-phase-c.md).
 
 	Compiled ONLY into renderer dynamic modules (OPENQ4_RENDERER_MODULE,
-	with OPENQ4_RENDERER_GL_MODULE / OPENQ4_RENDERER_VK_MODULE selecting the
+	with OPENQ4_RENDERER_GL_MODULE / OPENQ4_RENDERER_DK selecting the
 	backend tail); the engine's renderer glob sees an empty translation
 	unit. Mirrors the game-DLL convention: defines the engine interface
 	globals the renderer sources bind against, initializes idlib, provides
@@ -481,7 +481,7 @@ void QGL_Shutdown( void ) {
 GetRenderAPI
 ====================
 */
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 // Vulkan backend tail hooks (VulkanModule.cpp / VulkanBringup.cpp); declared
 // at file scope so they keep C++ linkage even when called from inside the
 // extern-C GetRenderAPI body (block-scope externs there would take C linkage)
@@ -493,7 +493,7 @@ bool VK_Device_QueryCatalog(renderDeviceCatalog_t*);
 #endif
 
 static void RGM_Shutdown( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	VK_Bringup_Shutdown();
 #endif
 	idSIMD::Shutdown();
@@ -521,7 +521,7 @@ renderExport_t *GetRenderAPI( renderImport_t *moduleImport ) {
 	rgm_services = moduleImport->services;
 	rgm_windowServices = moduleImport->windowServices;
 
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	VK_ModuleBindServices( rgm_services );
 #endif
 
@@ -567,7 +567,7 @@ renderExport_t *GetRenderAPI( renderImport_t *moduleImport ) {
     rgm_export.PrepareColdImagePolicyRecovery=R_PrepareColdImagePolicyRecovery;
     rgm_export.CancelImagePolicyRecovery=R_CancelPreparedImagePolicyRecovery;
     rgm_export.ReleaseImagePolicyRecovery=R_ReleaseCompletedImagePolicyRecovery;
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	// the Vulkan backend keeps its bring-up diagnostics surface for the
 	// on-demand rendererVkProbe flow
 	rgm_export.diagnostics = VK_GetModuleDiagnostics();

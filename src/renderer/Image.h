@@ -282,6 +282,7 @@ public:
 	static void			GetGeneratedName(idStr& _name, const char* _policyName, const textureUsage_t& _usage, const cubeFiles_t& _cube, bool allowDownSize = true, unsigned int flags = 0, const imageDownsizePolicy_t* consumed = NULL);
 
 	unsigned int		GetDeviceHandle(void) { return texnum; }
+	struct dkImageData_t *	GetDkData() const { return dkData; }
 private:
 	friend class idImageManager;
 
@@ -314,7 +315,9 @@ private:
 
 	static const unsigned int TEXTURE_NOT_LOADED = 0xFFFFFFFF;
 
-	unsigned int				texnum;				// gl texture binding
+	unsigned int				texnum;				// image descriptor
+	struct dkImageData_t *		dkData = NULL;		// the GPU image, dk_image.cpp
+	int							samplerIndex = 0;	// sampler descriptor for filter and repeat
 
 	// we could derive these in subImageUpload each time if necessary
 	unsigned int				internalFormat;

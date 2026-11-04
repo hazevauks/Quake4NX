@@ -2748,6 +2748,8 @@ static int LightGrid_GetBakeWorkerCount() {
 	SYSTEM_INFO systemInfo;
 	GetNativeSystemInfo( &systemInfo );
 	const int logicalCpuCount = ( int )systemInfo.dwNumberOfProcessors;
+#elif defined( __SWITCH__ )
+	const int logicalCpuCount = 3;	// the application's cores
 #else
 	const long onlineCpus = sysconf( _SC_NPROCESSORS_ONLN );
 	const int logicalCpuCount = onlineCpus > 0 ? ( int )onlineCpus : 1;

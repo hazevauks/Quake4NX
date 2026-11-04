@@ -80,13 +80,6 @@ int				rb_debugPolygonTime = 0;
 
 static void RB_DrawText( const char *text, const idVec3 &origin, float scale, const idVec4 &color, const idMat3 &viewAxis, const int align );
 
-#if defined( OPENQ4_RENDERER_VK_MODULE )
-// Vulkan cannot read pixels back in the middle of a frame; the module's
-// versions of these (and RB_ScanStencilBuffer) are in Vulkan/vk_DebugTools.cpp
-void RB_CountStencilBuffer( void );
-void RB_ShowIntensity( void );
-void RB_ShowDepthBuffer( void );
-#endif
 
 /*
 ================
@@ -404,7 +397,6 @@ void RB_ShowDestinationAlpha( void ) {
 
 ===============================================================================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )
 
 // The single-sample copies: [0] color, [1] depth/stencil. The names belong to
 // the GL context generation that made them; a new context forgets them.
@@ -598,7 +590,6 @@ static bool RB_ReadFramebufferPixels( GLenum format, GLenum type, void *pixels )
 	}
 	return read;
 }
-#endif
 
 /*
 ===================
@@ -607,7 +598,7 @@ RB_ScanStencilBuffer
 Debugging tool to see what values are in the stencil buffer
 ===================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )	// Vulkan: Vulkan/vk_DebugTools.cpp
+#if 1
 void RB_ScanStencilBuffer( void ) {
 	int		counts[256];
 	int		i;
@@ -646,7 +637,7 @@ RB_CountStencilBuffer
 Print an overdraw count based on stencil index values
 ===================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )	// Vulkan: Vulkan/vk_DebugTools.cpp
+#if 1
 void RB_CountStencilBuffer( void ) {
 	int		count;
 	int		i;
@@ -1105,7 +1096,7 @@ The greatest of the rgb values at each pixel will be used, with
 the resulting color shading from red at 0 to green at 128 to blue at 255
 ===================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )	// Vulkan: Vulkan/vk_DebugTools.cpp
+#if 1
 void RB_ShowIntensity( void ) {
 	byte	*colorReadback;
 	int		i, j, c;
@@ -1167,7 +1158,7 @@ RB_ShowDepthBuffer
 Draw the depth buffer as colors
 ===================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )	// Vulkan: Vulkan/vk_DebugTools.cpp
+#if 1
 void RB_ShowDepthBuffer( void ) {
 	void	*depthReadback;
 
@@ -3080,7 +3071,6 @@ Vulkan module the GL calls below are stubs, and LevelShotDepth.h promises that
 only the GL backend fills the capture.
 =================
 */
-#if !defined( OPENQ4_RENDERER_VK_MODULE )
 static void RB_CaptureLevelshotDepth( void ) {
 	levelshotDepthCapture_t &capture = tr_levelshotDepthCapture;
 	if ( capture.linearDepth == NULL || capture.captured ) {
@@ -3144,7 +3134,6 @@ static void RB_CaptureLevelshotDepth( void ) {
 	}
 	capture.captured = true;
 }
-#endif
 
 /*
 =================
@@ -3157,9 +3146,7 @@ void RB_RenderDebugTools( drawSurf_t **drawSurfs, int numDrawSurfs ) {
 		return;
 	}
 
-#if !defined( OPENQ4_RENDERER_VK_MODULE )
 	RB_CaptureLevelshotDepth();
-#endif
 
 	RB_LogComment( "---------- RB_RenderDebugTools ----------\n" );
 

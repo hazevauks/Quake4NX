@@ -676,7 +676,7 @@ void *R_GetCommandBuffer( int bytes );
 	R_RenderThread_Sync first. Other modules run the backend on the calling
 	thread, so these are no-ops there.
 */
-#if defined( OPENQ4_RENDERER_VK_MODULE )
+#if defined( OPENQ4_RENDERER_DK )
 void	R_RenderThread_Init( void );
 bool	R_RenderThread_Begin( const emptyCommand_t *cmds );
 void	R_RenderThread_Sync( const char *reason );
@@ -2449,14 +2449,8 @@ void RB_ShutdownDebugTools( void );
 // Vulkan module draws those tools through a fixed-function emulation
 // (Vulkan/vk_DebugTools.cpp) that has to see which image is bound; OpenGL
 // binds it as usual.
-#if defined( OPENQ4_RENDERER_VK_MODULE )
-void VK_DebugGL_BindImage( idImage *image );
-#define RB_BindDebugImage( image )	VK_DebugGL_BindImage( image )
-#define RB_BindNullDebugImage()		VK_DebugGL_BindImage( NULL )
-#else
 #define RB_BindDebugImage( image )	( image )->Bind()
 #define RB_BindNullDebugImage()		globalImages->BindNull()
-#endif
 void RB_ShutdownScenePostProcess( void );
 void RB_ApplyColorMappingsToBackBuffer( void );
 

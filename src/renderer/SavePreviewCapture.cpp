@@ -1,7 +1,7 @@
 #include "tr_local.h"
 #include "SavePreviewCapture.h"
 
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 static GLuint savePreviewBuffer = 0;
 static GLsync savePreviewFence = NULL;
 static int savePreviewState = 0; // idle, requested, submitted, mapped; -1 failed
@@ -83,6 +83,44 @@ void RB_ReleaseSavePreview() {
 	if ( savePreviewFence != NULL ) glDeleteSync( savePreviewFence );
 	savePreviewBuffer = 0;
 	savePreviewFence = NULL;
+	savePreviewState = 0;
+}
+#else
+/*
+The console has no OpenGL to read back from: the finished frame is copied on the
+spot, which waits for the GPU. A save is rare enough for that to go unnoticed.
+*/
+bool Dk_ReadPixels( int x, int y, int width, int height, void *pixels, int components );
+
+static byte *savePreviewPixels = NULL;
+static int savePreviewState = 0; // idle, requested, ready; -1 failed
+
+bool RB_RequestSavePreview() {
+	if ( savePreviewState != 0 || !glConfig.isInitialized ) return false;
+	savePreviewState = 1;
+	return true;
+}
+
+void RB_QueueSavePreview() {
+	if ( savePreviewState != 1 || tr.takingScreenshot ) return;
+	savePreviewState = -1;
+	savePreviewPixels = (byte *)R_StaticAlloc( glConfig.vidWidth * glConfig.vidHeight * 4 );
+	if ( Dk_ReadPixels( 0, 0, glConfig.vidWidth, glConfig.vidHeight, savePreviewPixels, 4 ) ) savePreviewState = 2;
+}
+
+int RB_PollSavePreview( const byte *&pixels, int &width, int &height, bool &topDown, bool &bgra ) {
+	if ( savePreviewState <= 0 ) return -1;
+	if ( savePreviewState == 1 ) return 0;
+	pixels = savePreviewPixels;
+	width = glConfig.vidWidth;
+	height = glConfig.vidHeight;
+	topDown = bgra = false;
+	return 1;
+}
+
+void RB_ReleaseSavePreview() {
+	if ( savePreviewPixels != NULL ) R_StaticFree( savePreviewPixels );
+	savePreviewPixels = NULL;
 	savePreviewState = 0;
 }
 #endif

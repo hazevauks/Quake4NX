@@ -1430,6 +1430,7 @@ void R_CombineCubeImages_f( const idCmdArgs &args ) {
 UnbindAll
 ===============
 */
+#ifndef OPENQ4_RENDERER_DK
 void idImageManager::UnbindAll() {
 	int oldTMU = backEnd.glState.currenttmu;
 	for ( int i = 1; i < MAX_MULTITEXTURE_UNITS; ++i ) {
@@ -1438,12 +1439,15 @@ void idImageManager::UnbindAll() {
 	}
 	backEnd.glState.currenttmu = oldTMU;
 }
+#endif
+
 
 /*
 ===============
 BindNull
 ===============
 */
+#ifndef OPENQ4_RENDERER_DK
 void idImageManager::BindNull() {
 	tmu_t* tmu;
 	if ( backEnd.glState.currenttmu < 0 || backEnd.glState.currenttmu >= MAX_MULTITEXTURE_UNITS ) {
@@ -1463,6 +1467,8 @@ void idImageManager::BindNull() {
 	tmu->textureType = TT_DISABLED;
 
 }
+#endif
+
 
 /*
 ===============

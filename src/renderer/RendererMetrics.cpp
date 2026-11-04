@@ -7,8 +7,7 @@
 #include "RendererUpload.h"
 #include "GpuFrameTimingCore.h"
 #include <chrono>
-#ifdef OPENQ4_RENDERER_VK_MODULE
-#include "Vulkan/VulkanGpuFrameTiming.h"
+#ifdef OPENQ4_RENDERER_DK
 #endif
 
 typedef struct rendererMetricsFrame_s {
@@ -905,7 +904,7 @@ static const char *R_RendererMetrics_FormatGpuMsec( const rendererMetricsFrame_t
 	return buffer;
 }
 
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 static bool R_RendererMetrics_GlTimestampQueriesSupported( void ) {
 	// EXT_timer_query only provides elapsed queries. Timestamp pairs require
 	// OpenGL 3.3 or ARB_timer_query, regardless of exported loader functions.
@@ -2611,7 +2610,7 @@ void R_RendererMetrics_EndFrame( int frontEndMsec, int backEndMsec, int viewCoun
 }
 
 void R_RendererMetrics_BeginGpuBackendFrame( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	// Vulkan brackets its true command-buffer lifetime in vk_GuiExecutor;
 	// the shared command-dispatch hook is intentionally not used there.
 	return;
@@ -2681,7 +2680,7 @@ void R_RendererMetrics_BeginGpuBackendFrame( void ) {
 }
 
 void R_RendererMetrics_EndGpuBackendFrame( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	return;
 #else
 	if ( rg_gpuTimerQueryActive ) {
@@ -2752,8 +2751,7 @@ void R_RendererMetrics_ResumeGpuTimer( rendererGpuTimerSlot_t slot, bool resume 
 }
 
 void R_RendererMetrics_ShutdownGpuTimers( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	VK_GpuFrameTiming_Shutdown();
+#ifdef OPENQ4_RENDERER_DK
 	R_RendererMetrics_SetGpuFrameTimingBackend( RENDER_GPU_TIMING_BACKEND_NONE, false );
 	return;
 #else
@@ -2793,16 +2791,16 @@ void R_RendererMetrics_ShutdownGpuTimers( void ) {
 }
 
 bool R_RendererMetrics_GpuTimersAvailable( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	return VK_GpuFrameTiming_Available();
+#ifdef OPENQ4_RENDERER_DK
+	return false;
 #else
 	return R_RendererMetrics_GlFullFrameTimingAvailable();
 #endif
 }
 
 bool RendererGpuTimer_RunSelfTest( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	return VK_GpuFrameTiming_RunSelfTest();
+#ifdef OPENQ4_RENDERER_DK
+	return true;
 #else
 	if ( !R_RendererMetrics_GpuTimersAvailable() ) {
 		common->Printf( "RendererGpuTimer self-test skipped: GL timer queries are unavailable\n" );

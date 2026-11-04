@@ -30,7 +30,7 @@ If you have questions concerning this license or the applicable additional terms
 
 
 #include "tr_local.h"
-#if !defined( OPENQ4_RENDERER_VK_MODULE ) && !defined( OPENQ4_RENDERER_GLES_MODULE )
+#if !defined( OPENQ4_RENDERER_DK ) && !defined( OPENQ4_RENDERER_GLES_MODULE )
 #include "draw_pbr.h"
 #endif
 #include "OpenGL/FramebufferSamples.h"
@@ -2601,9 +2601,9 @@ static int R_BenchmarkPercentileIndex( int count, int percentile ) {
 // Each benchmark sample must include its GPU work. glFinish is an inert stub
 // in the Vulkan module, so that backend waits for its submitted frames.
 static void R_BenchmarkFinish( void ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	extern void VK_Device_WaitIdleForTiming( void );
-	VK_Device_WaitIdleForTiming();
+#ifdef OPENQ4_RENDERER_DK
+	extern void Dk_WaitIdle( void );
+	Dk_WaitIdle();
 #else
 	glFinish();
 #endif
@@ -2761,9 +2761,9 @@ captures responsible for their own scissor rects, which they are not.
 idCVar r_screenshotKeepScissor( "r_screenshotKeepScissor", "0", CVAR_RENDERER | CVAR_BOOL,
 		"screenshots re-render with the scissor left as the frame loop set it, so scissor-dependent faults are visible in a capture" );
 
-#ifdef OPENQ4_RENDERER_VK_MODULE
-bool VK_GLStubs_ConsumeReadPixelsFailure( void );
-bool VK_Device_DrawableSize( int &width, int &height );
+#ifdef OPENQ4_RENDERER_DK
+bool Dk_ConsumeReadPixelsFailure( void );
+bool Dk_DrawableSize( int &width, int &height );
 #endif
 
 // TakeScreenshot's verdict for the commands that report "Wrote".
@@ -2780,8 +2780,8 @@ bool R_ReadTiledPixels( int width, int height, byte *buffer, renderView_t *ref =
 	byte	*temp = (byte *)R_StaticAlloc( (glConfig.vidWidth+3) * glConfig.vidHeight * 3 );
 	memset( temp, 0, (glConfig.vidWidth+3) * glConfig.vidHeight * 3 );
 	bool	captured = true;
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	(void)VK_GLStubs_ConsumeReadPixelsFailure();
+#ifdef OPENQ4_RENDERER_DK
+	(void)Dk_ConsumeReadPixelsFailure();
 #endif
 
 	// OpenGL ES guarantees exactly one glReadPixels format for the default
@@ -2864,8 +2864,8 @@ bool R_ReadTiledPixels( int width, int height, byte *buffer, renderView_t *ref =
 			// work is forced to complete first -- which is why ES screenshots
 			// came out uniformly black while the frame on screen was correct.
 			glReadPixels( 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgbaTemp );
-#ifdef OPENQ4_RENDERER_VK_MODULE
-			if ( VK_GLStubs_ConsumeReadPixelsFailure() ) {
+#ifdef OPENQ4_RENDERER_DK
+			if ( Dk_ConsumeReadPixelsFailure() ) {
 				captured = false;
 				memset( rgbaTemp, 0, (oldWidth+3) * oldHeight * 4 );
 			}
@@ -2909,13 +2909,13 @@ bool R_ReadTiledPixels( int width, int height, byte *buffer, renderView_t *ref =
 	// the window's size is restored here.
 	glConfig.vidWidth = oldWidth;
 	glConfig.vidHeight = oldHeight;
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	// Vulkan publishes each new drawable size from its swapchain. A resize
 	// during the capture leaves the tiles sized for the old window: keep the
 	// new size rather than restoring a stale one, and fail the capture.
 	int drawableWidth = 0;
 	int drawableHeight = 0;
-	if ( VK_Device_DrawableSize( drawableWidth, drawableHeight )
+	if ( Dk_DrawableSize( drawableWidth, drawableHeight )
 			&& ( drawableWidth != oldWidth || drawableHeight != oldHeight ) ) {
 		common->Warning( "screenshot: the window changed from %dx%d to %dx%d during the capture",
 				oldWidth, oldHeight, drawableWidth, drawableHeight );
@@ -4626,7 +4626,7 @@ static int R_GfxInfoGLMaxSamples( bool &available ) {
 	return maxSamples;
 }
 
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 /*
 ================
 R_GfxInfoObservedMSAA
@@ -4690,7 +4690,7 @@ static void R_GfxInfoPrintAAState( void ) {
 	// A rejected modern transaction leaves the native renderer in charge,
 	// including its multisample target and post AA. Report the frame that was
 	// actually presented, not the requested owner or its discarded sidecar.
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 	const bool modernVisiblePost = R_ModernGLExecutor_ModernVisibleRequestedForPost()
 		&& R_ModernGLExecutor_Stats().modernVisibleExecuted;
 	// The test idImage::AllocImage makes before it allocates a multisample
@@ -4706,15 +4706,14 @@ static void R_GfxInfoPrintAAState( void ) {
 	// Once a main scene has drawn in this context, report the samples of the
 	// target it drew into. Before that (startup self-tests) predict them.
 	bool mainSceneObserved = false;
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 	mainSceneObserved = !modernVisiblePost && R_GfxInfoObservedMSAA( requestedMSAA,
 		glMaxSamples, maxSamplesAvailable, textureMSAAAvailable, effectiveMSAA, msaaReason );
 #endif
 	if ( !mainSceneObserved && requestedMSAA > 1 ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
-		extern int VK_PostProcess_SceneSamples( void );
-		effectiveMSAA = VK_PostProcess_SceneSamples();
-		msaaReason = effectiveMSAA > 1 ? "vulkan-scene" : "vulkan-scene-single-sample";
+#ifdef OPENQ4_RENDERER_DK
+		effectiveMSAA = 1;
+		msaaReason = "deko3d-single-sample";
 #else
 		if ( modernVisiblePost ) {
 			const modernGLExecutorStats_t &modern = R_ModernGLExecutor_Stats();
@@ -4752,7 +4751,7 @@ static void R_GfxInfoPrintAAState( void ) {
 	} else if ( r_skipPostProcess.GetBool() ) {
 		postAAEffective = false;
 		postAAReason = "r_skipPostProcess";
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 	// Vulkan embeds its native SMAA programs and has no OpenGL GLSL context.
 	} else if ( !glConfig.GLSLProgramAvailable ) {
 		postAAEffective = false;
@@ -4960,7 +4959,7 @@ void GfxInfo_f( const idCmdArgs &args ) {
 		RENDER_GRAPH_MAX_RESOURCE_ACCESSES );
 	R_RenderGraphResources_PrintGfxInfo();
 	R_MaterialResourceTable_PrintGfxInfo();
-#if !defined( OPENQ4_RENDERER_VK_MODULE ) && !defined( OPENQ4_RENDERER_GLES_MODULE )
+#if !defined( OPENQ4_RENDERER_DK ) && !defined( OPENQ4_RENDERER_GLES_MODULE )
 	RB_GLPBR_PrintInfo();
 #endif
 	{
@@ -5496,7 +5495,7 @@ void GfxInfo_f( const idCmdArgs &args ) {
 		r_pbrInferFromLegacyMaterials.GetBool() ? 1 : 0,
 		r_pbrDebug.GetInteger() );
 	R_ModernGLExecutor_PrintGfxInfo();
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 	RB_HDRPrintGfxInfo();
 #endif
 	R_ModernClusteredLighting_PrintGfxInfo();
@@ -5726,7 +5725,7 @@ static bool R_TryFullVidRestartInternal( const renderWindowRequest_t *request, b
 			R_ClearActiveRenderTextures();
 			R_InitFreeType();
 			R_RefreshConsoleFontAtlas();
-#ifndef OPENQ4_RENDERER_VK_MODULE
+#ifndef OPENQ4_RENDERER_DK
 			if ( !GLimp_EnsureActiveContext( "recoverable renderer resource reload" ) || glGetError() != GL_NO_ERROR )
 				R_RejectRecoverableRendererRestart( "OpenGL context or font resource reload failed" );
 #endif
@@ -6140,25 +6139,7 @@ void R_InitCommands( void ) {
 	cmdSystem->AddCommand( "rendererUploadSelfTest", R_RendererUploadSelfTest_f, CMD_FL_RENDERER, "run renderer upload stream self tests" );
 	cmdSystem->AddCommand( "rendererGpuSkinningSelfTest", R_RendererGpuSkinningSelfTest_f, CMD_FL_RENDERER, "run renderer GPU skinning contract self tests" );
 	cmdSystem->AddCommand( "rendererContractsSelfTest", R_RendererContractsSelfTest_f, CMD_FL_RENDERER, "run renderer layout and buffer contract self tests" );
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	extern void R_RendererVulkanRenderTargetsSelfTest_f( const idCmdArgs &args );
-	extern void R_RendererVulkanHDRInfo_f( const idCmdArgs &args );
-	extern void R_RendererVulkanHDRSelfTest_f( const idCmdArgs &args );
-	extern void R_RendererVulkanTemporalMotionSelfTest_f( const idCmdArgs &args );
-	extern void R_RendererVulkanMemoryInfo_f( const idCmdArgs &args );
-	extern void R_RendererVulkanPresentTiming_f( const idCmdArgs &args );
-	cmdSystem->AddCommand( "rendererPresentTiming", R_RendererVulkanPresentTiming_f,
-			CMD_FL_RENDERER, "when frames reached the display since the last 'rendererPresentTiming reset' (r_vkPresentTiming 1, VK_KHR_present_wait)" );
-	cmdSystem->AddCommand( "rendererVulkanTemporalMotionSelfTest", R_RendererVulkanTemporalMotionSelfTest_f,
-			CMD_FL_RENDERER, "test Vulkan rigid temporal motion and history rejection on the active GPU" );
-	cmdSystem->AddCommand( "rendererVulkanMemoryInfo", R_RendererVulkanMemoryInfo_f,
-			CMD_FL_RENDERER, "report Vulkan memory heap usage, budget and live allocations" );
-	cmdSystem->AddCommand( "rendererVulkanHDRSelfTest", R_RendererVulkanHDRSelfTest_f,
-			CMD_FL_RENDERER, "test Vulkan floating-point scenes and exposure on the active GPU" );
-	cmdSystem->AddCommand( "rendererVulkanHDRInfo", R_RendererVulkanHDRInfo_f,
-			CMD_FL_RENDERER, "report Vulkan HDR luminance and exposure state" );
-	cmdSystem->AddCommand( "rendererVulkanRenderTargetsSelfTest", R_RendererVulkanRenderTargetsSelfTest_f,
-			CMD_FL_RENDERER, "validate Vulkan cubemap render targets and color/depth captures on the active device" );
+#ifdef OPENQ4_RENDERER_DK
 #endif
 	cmdSystem->AddCommand( "rendererGpuTimerSelfTest", R_RendererGpuTimerSelfTest_f, CMD_FL_RENDERER, "run renderer GPU timer query self tests" );
 	cmdSystem->AddCommand( "rendererTemporalPresentationStatus", R_TemporalPresentation_PrintStatus_f, CMD_FL_RENDERER, "report dynamic-resolution and temporal-history state" );
@@ -6437,10 +6418,7 @@ idRenderSystemLocal::BeginLevelLoad
 */
 void idRenderSystemLocal::BeginLevelLoad( void ) {
 	R_RendererMetrics_ResetGpuFrameTiming( "begin level load" );
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	// keep what the last map compiled even if this session never exits cleanly
-	extern void VK_Device_PersistPipelineCache( const char *reason );
-	VK_Device_PersistPipelineCache( "since the last save" );
+#ifdef OPENQ4_RENDERER_DK
 #endif
 	// SetUnderwaterView is the only writer of this state, and it is driven by the game
 	// each frame. A map change started while the player was submerged would otherwise
@@ -6496,11 +6474,11 @@ static bool R_InitRendererDevice( bool legacyPolicy, bool forceWindow, char *err
 	}
 	// if the device isn't started, start it now
 	if ( !glConfig.isInitialized ) {
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 		// Vulkan backend seam (Phase C): device + swapchain bring-up through
 		// the window services; no GL ladder, caps probe, or program loads
-		extern bool VK_InitRenderDevice( void );
-		if ( !VK_InitRenderDevice() ) {
+		extern bool Dk_InitRenderDevice( void );
+		if ( !Dk_InitRenderDevice() ) {
 			if ( legacyPolicy ) {
 				// Initial startup uses the recoverable PrepareStartupDevice export
 				// before reaching this call. A failure here belongs to a later
@@ -6609,7 +6587,7 @@ void idRenderSystemLocal::ShutdownOpenGL( void ) {
 	R_ClassicInteractionDomain_ResetFrame();
 	R_ClassicFogBlendDomain_ResetFrame();
 	R_ClassicSubviewDomain_ResetFrame();
-#ifdef OPENQ4_RENDERER_VK_MODULE
+#ifdef OPENQ4_RENDERER_DK
 	// Vulkan backend seam (Phase C): the GL executor/upload/graph/debug
 	// subsystems never initialized; device + window teardown is GLimp_Shutdown
 	R_MaterialResourceTable_Shutdown();

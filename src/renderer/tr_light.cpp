@@ -32,9 +32,6 @@ If you have questions concerning this license or the applicable additional terms
 #include "tr_local.h"
 #include "ShadowMapClassification.h"
 #include "../sound/sound.h"
-#ifdef OPENQ4_RENDERER_VK_MODULE
-#include "Vulkan/vk_MaterialPrograms.h"
-#endif
 
 static ID_INLINE idSoundEmitter *R_GetShaderSoundEmitter( int soundEmitterHandle ) {
 	if ( soundEmitterHandle == 0 || soundSystem == NULL ) {
@@ -1610,21 +1607,6 @@ bool R_ShadowMapLightWillUseShadowMaps( const idRenderLightLocal *lightDef ) {
 		}
 	}
 	if ( !RB_ShadowMapResourcesKnownGood( pointLightPath ) ) { return false; }
-#ifdef OPENQ4_RENDERER_VK_MODULE
-	// Authored lighting has no engine shadow-map sampler in its shader ABI.
-	// Its receiver chain uses stencil, so retain volumes before any entity's
-	// interaction is submitted. Checking only the currently submitted surface
-	// is too late: earlier entities may already have discarded their volumes.
-	// An unbuilt interaction is conservatively unknown, never evidence that
-	// every receiver supports maps. This also covers newly spawned receivers.
-	for ( const idInteraction *inter = lightDef->firstInteraction; inter != NULL; inter = inter->lightNext ) {
-		if ( inter->numSurfaces < 0 ) { return false; }
-		for ( int i = 0; i < inter->numSurfaces; ++i ) {
-			if ( inter->surfaces[i].shader == NULL
-					|| VK_MaterialPrograms_NeedsStencil( inter->surfaces[i].shader, NULL ) ) { return false; }
-		}
-	}
-#endif
 	return true;
 }
 
