@@ -1,0 +1,880 @@
+/*
+===========================================================================
+
+Doom 3 GPL Source Code
+Copyright (C) 1999-2011 id Software LLC, a ZeniMax Media company. 
+
+This file is part of the Doom 3 GPL Source Code (?Doom 3 Source Code?).  
+
+Doom 3 Source Code is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Doom 3 Source Code is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Doom 3 Source Code.  If not, see <http://www.gnu.org/licenses/>.
+
+In addition, the Doom 3 Source Code is also subject to certain additional terms. You should have received a copy of these additional terms immediately following the terms and conditions of the GNU General Public License which accompanied the Doom 3 Source Code.  If not, please request a copy in writing from id Software at the address below.
+
+If you have questions concerning this license or the applicable additional terms, you may contact in writing id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
+
+===========================================================================
+*/
+
+
+
+
+#include "AsyncNetwork.h"
+#include "../ArenaCampaign.h"
+
+idAsyncServer		idAsyncNetwork::server;
+idAsyncClient		idAsyncNetwork::client;
+idMultiViewDemo		idAsyncNetwork::multiViewDemo;
+
+idCVar				idAsyncNetwork::verbose( "net_verbose", "0", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "1 = verbose output, 2 = even more verbose output", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
+idCVar				idAsyncNetwork::allowCheats( "net_allowCheats", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NETWORKSYNC, "legacy multiplayer cheats toggle (use sv_cheats)" );
+idCVar				idAsyncNetwork::svCheats( "sv_cheats", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NETWORKSYNC | CVAR_SERVERINFO, "Quake III style multiplayer cheats toggle" );
+#ifdef ID_DEDICATED
+// dedicated executable can only have a value of 1 for net_serverDedicated
+idCVar				idAsyncNetwork::serverDedicated( "net_serverDedicated", "1", CVAR_SERVERINFO | CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT | CVAR_ROM, "" );
+#else
+idCVar				idAsyncNetwork::serverDedicated( "net_serverDedicated", "0", CVAR_SERVERINFO | CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "1 = text console dedicated server, 2 = graphical dedicated server", 0, 2, idCmdSystem::ArgCompletion_Integer<0,2> );
+#endif
+// openQ4: snapshots carry everything a client is told about the world - entity
+// state, projectiles, and the whole batch of replicated effects, hit scans and
+// events - so this interval is the granularity of all of it.  33ms is two 60Hz
+// server frames and halves the worst-case age of a replicated effect against the
+// 50ms this shipped with, which is worth having now that the rate cap below no
+// longer throttles the stream below the asked-for rate anyway.
+idCVar				idAsyncNetwork::serverSnapshotDelay( "net_serverSnapshotDelay", "33", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "delay between snapshots in milliseconds" );
+// openQ4: these are ceilings, not reservations - a match only ever uses what its
+// snapshots actually need.  But the channel's token bucket refuses to send until
+// the previous packet has been paid for at this rate, so a cap below
+// snapshotSize * snapshotHz does not shed bytes, it sheds whole snapshots.  At
+// the 25600 this shipped with, that threshold was ~1280 bytes: measured on a
+// listen server, a client being served ~2.9KB snapshots received 2-3 a second
+// against the 20 it asked for, with 44-130 sends a second refused outright.  That
+// is a client that stops seeing projectiles, impacts and events precisely when
+// the action is heavy enough to grow the snapshot.  128000 clears the worst
+// snapshot a full server produces with room to spare; a server that must limit a
+// narrow uplink can still lower it.
+idCVar				idAsyncNetwork::serverMaxClientRate( "net_serverMaxClientRate", "128000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_ARCHIVE | CVAR_NOCHEAT, "maximum rate to a client in bytes/sec" );
+idCVar				idAsyncNetwork::clientMaxRate( "net_clientMaxRate", "128000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_ARCHIVE | CVAR_NOCHEAT, "maximum rate requested by client from server in bytes/sec" );
+idCVar				idAsyncNetwork::serverMaxUsercmdRelay( "net_serverMaxUsercmdRelay", "5", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "maximum number of usercmds from other clients the server relays to a client", 1, MAX_USERCMD_RELAY, idCmdSystem::ArgCompletion_Integer<1,MAX_USERCMD_RELAY> );
+idCVar				idAsyncNetwork::serverZombieTimeout( "net_serverZombieTimeout", "5", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "disconnected client timeout in seconds" );
+idCVar				idAsyncNetwork::serverClientTimeout( "net_serverClientTimeout", "40", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "client time out in seconds" );
+idCVar				idAsyncNetwork::clientServerTimeout( "net_clientServerTimeout", "40", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "server time out in seconds" );
+idCVar				idAsyncNetwork::serverDrawClient( "net_serverDrawClient", "-1", CVAR_SYSTEM | CVAR_INTEGER, "number of client for which to draw view on server" );
+idCVar				idAsyncNetwork::serverRemoteConsolePassword( "net_serverRemoteConsolePassword", "", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_PRIVATE | CVAR_CASE_SENSITIVE, "private remote console password (rcon2 requires at least 12 bytes)" );
+idCVar				idAsyncNetwork::serverAllowLegacyRcon( "net_serverAllowLegacyRcon", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NOCHEAT, "allow the insecure legacy plaintext rcon protocol" );
+idCVar				idAsyncNetwork::clientPrediction( "net_clientPrediction", "16", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "additional client side prediction in milliseconds (legacy value 16 follows one exact base tic)" );
+idCVar				idAsyncNetwork::clientMaxPrediction( "net_clientMaxPrediction", "1000", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "maximum number of milliseconds a client can predict ahead of server." );
+idCVar				idAsyncNetwork::clientUsercmdBackup( "net_clientUsercmdBackup", "5", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "number of usercmds to resend" );
+idCVar				idAsyncNetwork::clientRemoteConsoleAddress( "net_clientRemoteConsoleAddress", "localhost", CVAR_SYSTEM | CVAR_NOCHEAT, "remote console address" );
+idCVar				idAsyncNetwork::clientRemoteConsolePassword( "net_clientRemoteConsolePassword", "", CVAR_SYSTEM | CVAR_NOCHEAT | CVAR_PRIVATE | CVAR_CASE_SENSITIVE, "private remote console password" );
+idCVar				idAsyncNetwork::clientUseLegacyRcon( "net_clientUseLegacyRcon", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NOCHEAT, "send the insecure legacy plaintext rcon protocol" );
+idCVar				idAsyncNetwork::master0( "net_master0", IDNET_HOST ":" IDNET_MASTER_PORT, CVAR_SYSTEM | CVAR_ROM, "idnet master server address" );
+idCVar				idAsyncNetwork::master1( "net_master1", "", CVAR_SYSTEM | CVAR_ARCHIVE, "1st master server address" );
+idCVar				idAsyncNetwork::master2( "net_master2", "", CVAR_SYSTEM | CVAR_ARCHIVE, "2nd master server address" );
+idCVar				idAsyncNetwork::master3( "net_master3", "", CVAR_SYSTEM | CVAR_ARCHIVE, "3rd master server address" );
+idCVar				idAsyncNetwork::master4( "net_master4", "", CVAR_SYSTEM | CVAR_ARCHIVE, "4th master server address" );
+idCVar				idAsyncNetwork::LANServer( "net_LANServer", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NOCHEAT, "config LAN games only - affects clients and servers" );
+idCVar				idAsyncNetwork::serverReloadEngine( "net_serverReloadEngine", "0", CVAR_SYSTEM | CVAR_INTEGER | CVAR_NOCHEAT, "perform a full reload on next map restart (including flushing referenced pak files) - decreased if > 0" );
+idCVar				idAsyncNetwork::serverAllowServerMod( "net_serverAllowServerMod", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_NOCHEAT, "allow server-side mods" );
+idCVar				idAsyncNetwork::idleServer( "si_idleServer", "0", CVAR_SYSTEM | CVAR_BOOL | CVAR_INIT | CVAR_SERVERINFO, "game clients are idle" );
+idCVar				idAsyncNetwork::clientDownload( "net_clientDownload", "1", CVAR_SYSTEM | CVAR_INTEGER | CVAR_ARCHIVE, "client pk4 downloads policy: 0 - never, 1 - ask, 2 - always (will still prompt for binary code)" );
+
+int					idAsyncNetwork::realTime;
+master_t			idAsyncNetwork::masters[ MAX_MASTER_SERVERS ];
+bool				idAsyncNetwork::dedicatedSpawnDeferred = false;
+
+/*
+==================
+idAsyncNetwork::idAsyncNetwork
+==================
+*/
+idAsyncNetwork::idAsyncNetwork( void ) {
+}
+
+/*
+==================
+AsyncNetwork_NetImpairment_f
+==================
+*/
+static void AsyncNetwork_NetImpairment_f( const idCmdArgs &args ) {
+	Sys_NetImpairmentReport();
+}
+
+/*
+==================
+AsyncNetwork_AppendDisplayText
+
+Network userinfo and remote disconnect reasons are display data, never command
+text. Preserve the legacy byte stream (including Quake color escapes), but fold
+ASCII control characters so one logical notification cannot create extra UI or
+console lines.
+==================
+*/
+static void AsyncNetwork_AppendDisplayText( idStr &output, const char *text, int maxBytes ) {
+	if ( text == NULL || maxBytes <= 0 ) {
+		return;
+	}
+
+	bool outputEndsInSpace = output.Length() > 0 && output[ output.Length() - 1 ] == ' ';
+	bool pendingSpace = false;
+	for ( int index = 0; index < maxBytes && text[ index ] != '\0'; index++ ) {
+		const unsigned char value = static_cast<unsigned char>( text[ index ] );
+		if ( value < 32 || value == 127 ) {
+			pendingSpace = output.Length() > 0 && !outputEndsInSpace;
+			continue;
+		}
+		if ( pendingSpace && text[ index ] != ' ' ) {
+			output.Append( ' ' );
+		}
+		pendingSpace = false;
+		output.Append( text[ index ] );
+		outputEndsInSpace = text[ index ] == ' ';
+	}
+}
+
+/*
+==================
+idAsyncNetwork::ShowClientDisconnectMessage
+
+Pass the completed display line as one already-tokenized argument. In
+particular, quotes, semicolons, and newlines originating in ui_name can never be
+reparsed as console syntax.
+==================
+*/
+void idAsyncNetwork::ShowClientDisconnectMessage( const char *clientName, const char *reason ) {
+	idStr displayName;
+	AsyncNetwork_AppendDisplayText( displayName, clientName, MAX_NICKLEN );
+	if ( displayName.IsEmpty() ) {
+		displayName = common->GetLanguageDict()->GetString( "#str_42461" );
+	}
+
+	idStr line = displayName;
+	line += "^0 ";
+	AsyncNetwork_AppendDisplayText( line, reason, MAX_STRING_CHARS - 1 );
+
+	idCmdArgs command;
+	command.AppendArg( "addChatLine" );
+	command.AppendArg( line.c_str() );
+	cmdSystem->BufferCommandArgs( CMD_EXEC_NOW, command );
+}
+
+/*
+==================
+idAsyncNetwork::Init
+==================
+*/
+void idAsyncNetwork::Init( void ) {
+
+	realTime = 0;
+	multiViewDemo.Init();
+
+	memset( masters, 0, sizeof( masters ) );
+	masters[0].var = &master0;
+	masters[1].var = &master1;
+	masters[2].var = &master2;
+	masters[3].var = &master3;
+	masters[4].var = &master4;
+
+#ifndef	ID_DEMO_BUILD
+	cmdSystem->AddCommand( "spawnServer", SpawnServer_f, CMD_FL_SYSTEM, "spawns a server", idCmdSystem::ArgCompletion_MapName );
+	cmdSystem->AddCommand( "nextMap", NextMap_f, CMD_FL_SYSTEM, "loads the next map on the server" );
+	cmdSystem->AddCommand( "connect", Connect_f, CMD_FL_SYSTEM, "connects to a server" );
+	cmdSystem->AddCommand( "reconnect", Reconnect_f, CMD_FL_SYSTEM, "reconnect to the last server we tried to connect to" );
+	cmdSystem->AddCommand( "serverInfo", GetServerInfo_f, CMD_FL_SYSTEM, "shows server info" );
+	cmdSystem->AddCommand( "LANScan", GetLANServers_f, CMD_FL_SYSTEM, "scans LAN for servers" );
+	cmdSystem->AddCommand( "listServers", ListServers_f, CMD_FL_SYSTEM, "lists scanned servers" );
+	cmdSystem->AddCommand( "rcon", RemoteConsole_f, CMD_FL_SYSTEM, "sends an authenticated remote console command to the server" );
+	cmdSystem->AddCommand( "heartbeat", Heartbeat_f, CMD_FL_SYSTEM, "send a heartbeat to the the master servers" );
+	cmdSystem->AddCommand( "kick", Kick_f, CMD_FL_SYSTEM, "kick a client by connection number" );
+	cmdSystem->AddCommand( "checkNewVersion", CheckNewVersion_f, CMD_FL_SYSTEM, "check if a new version of the game is available" );
+	cmdSystem->AddCommand( "updateUI", UpdateUI_f, CMD_FL_SYSTEM, "internal - cause a sync down of game-modified userinfo" );
+#endif
+	cmdSystem->AddCommand( "netImpairment", AsyncNetwork_NetImpairment_f, CMD_FL_SYSTEM, "reports the simulated network conditions (net_forceLatency, net_forceJitter, net_forceDrop, net_forceDuplicate) and what each open port's delay lines have done" );
+}
+
+/*
+==================
+idAsyncNetwork::GetMasterAddress
+==================
+*/
+netadr_t idAsyncNetwork::GetMasterAddress( void ) {
+	netadr_t ret;
+	GetMasterAddress( 0, ret );
+	return masters[ 0 ].address;
+}
+
+/*
+==================
+idAsyncNetwork::GetMasterAddress
+==================
+*/
+bool idAsyncNetwork::GetMasterAddress( int index, netadr_t &adr ) {
+	if ( !masters[ index ].var ) {
+		return false;
+	}	
+	if ( masters[ index ].var->GetString()[0] == '\0' ) {
+		return false;
+	}
+	if ( !masters[ index ].resolved || masters[ index ].var->IsModified() ) {
+		masters[ index ].var->ClearModified();
+		if ( !Sys_StringToNetAdr( masters[ index ].var->GetString(), &masters[ index ].address, true ) ) {
+			common->Printf( "Failed to resolve master%d: %s\n", index, masters[ index ].var->GetString() );
+			memset( &masters[ index ].address, 0, sizeof( netadr_t ) );
+			masters[ index ].resolved = true;
+			return false;
+		}
+		if ( masters[ index ].address.port == 0 ) {
+			masters[ index ].address.port = atoi( IDNET_MASTER_PORT );
+		}
+		masters[ index ].resolved = true;
+	}
+	adr = masters[ index ].address;
+	return true;
+}
+
+/*
+==================
+idAsyncNetwork::Shutdown
+==================
+*/
+void idAsyncNetwork::Shutdown( void ) {
+	multiViewDemo.Shutdown();
+	client.serverList.Shutdown();
+	client.DisconnectFromServer();
+	client.ClearServers();
+	client.ClosePort();
+	server.Kill();
+	server.ClosePort();
+}
+
+/*
+==================
+idAsyncNetwork::RunFrame
+==================
+*/
+void idAsyncNetwork::RunFrame( void ) {
+	if ( console->Active() ) {
+		Sys_GrabMouseCursor( false );
+		usercmdGen->InhibitUsercmd( INHIBIT_ASYNC, true );
+	} else {
+		Sys_GrabMouseCursor( true );
+		usercmdGen->InhibitUsercmd( INHIBIT_ASYNC, false );
+	}
+
+	// Phase 2 decouples presentation from the 60 Hz net game frames in foreground play.
+	// Dedicated-style paths can keep blocking until the next game frame because they are not
+	// trying to present repeated-state render frames in between async ticks.
+	const bool allowBlocking = ( idAsyncNetwork::serverDedicated.GetInteger() != 0 );
+	if ( multiViewDemo.IsPlaying() ) {
+		multiViewDemo.RunPlaybackFrame();
+		return;
+	}
+	client.RunFrame( allowBlocking );
+	server.RunFrame( allowBlocking );
+	if ( multiViewDemo.IsRecording() && server.IsActive() ) {
+		multiViewDemo.CaptureServerFrame( server.GetGameFrame(), server.GetGameTime() );
+	}
+}
+
+/*
+==================
+idAsyncNetwork::WriteUserCmdDelta
+==================
+*/
+void idAsyncNetwork::WriteUserCmdDelta( idBitMsg &msg, const usercmd_t &cmd, const usercmd_t *base ) {
+	if ( base ) {
+		msg.WriteDeltaLongCounter( base->gameTime, cmd.gameTime );
+		msg.WriteDeltaShort( base->buttons, cmd.buttons );
+		msg.WriteDeltaShort( base->mx, cmd.mx );
+		msg.WriteDeltaShort( base->my, cmd.my );
+		msg.WriteDeltaChar( base->forwardmove, cmd.forwardmove );
+		msg.WriteDeltaChar( base->rightmove, cmd.rightmove );
+		msg.WriteDeltaChar( base->upmove, cmd.upmove );
+		msg.WriteDeltaShort( base->angles[0], cmd.angles[0] );
+		msg.WriteDeltaShort( base->angles[1], cmd.angles[1] );
+		msg.WriteDeltaShort( base->angles[2], cmd.angles[2] );
+		return;
+	}
+
+	msg.WriteLong( cmd.gameTime );
+	msg.WriteShort( cmd.buttons );
+    msg.WriteShort( cmd.mx );
+	msg.WriteShort( cmd.my );
+	msg.WriteChar( cmd.forwardmove );
+	msg.WriteChar( cmd.rightmove );
+	msg.WriteChar( cmd.upmove );
+	msg.WriteShort( cmd.angles[0] );
+	msg.WriteShort( cmd.angles[1] );
+	msg.WriteShort( cmd.angles[2] );
+}
+
+/*
+==================
+idAsyncNetwork::ReadUserCmdDelta
+==================
+*/
+static bool AsyncNetwork_ProbeDeltaField( idBitMsg &probe, const int valueBits ) {
+	if ( probe.GetRemainingReadBits() < 1 ) {
+		return false;
+	}
+	const bool changed = probe.ReadBits( 1 ) != 0;
+	if ( changed ) {
+		if ( probe.GetRemainingReadBits() < valueBits ) {
+			return false;
+		}
+		probe.ReadBits( valueBits );
+	}
+	return true;
+}
+
+static bool AsyncNetwork_ProbeDeltaLongCounter( idBitMsg &probe ) {
+	if ( probe.GetRemainingReadBits() < 5 ) {
+		return false;
+	}
+	const int valueBits = probe.ReadBits( 5 );
+	if ( valueBits < 0 || valueBits > 31 ) {
+		return false;
+	}
+	if ( probe.GetRemainingReadBits() < valueBits ) {
+		return false;
+	}
+	if ( valueBits > 0 ) {
+		probe.ReadBits( valueBits );
+	}
+	return true;
+}
+
+static bool AsyncNetwork_CanReadUserCmdDelta( const idBitMsg &msg, const bool hasBase ) {
+	idBitMsg probe = msg;
+	if ( !hasBase ) {
+		// long + three shorts + three chars + three angle shorts
+		return probe.GetRemainingReadBits() >= 152;
+	}
+
+	return AsyncNetwork_ProbeDeltaLongCounter( probe ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 8 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 8 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 8 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 ) &&
+		AsyncNetwork_ProbeDeltaField( probe, 16 );
+}
+
+bool idAsyncNetwork::ReadUserCmdDelta( const idBitMsg &msg, usercmd_t &cmd, const usercmd_t *base ) {
+	if ( !AsyncNetwork_CanReadUserCmdDelta( msg, base != NULL ) ) {
+		return false;
+	}
+
+	usercmd_t decoded;
+	memset( &decoded, 0, sizeof( decoded ) );
+
+	if ( base ) {
+		decoded.gameTime = msg.ReadDeltaLongCounter( base->gameTime );
+		decoded.buttons = msg.ReadDeltaShort( base->buttons );
+		decoded.mx = msg.ReadDeltaShort( base->mx );
+		decoded.my = msg.ReadDeltaShort( base->my );
+		decoded.forwardmove = msg.ReadDeltaChar( base->forwardmove );
+		decoded.rightmove = msg.ReadDeltaChar( base->rightmove );
+		decoded.upmove = msg.ReadDeltaChar( base->upmove );
+		decoded.angles[0] = msg.ReadDeltaShort( base->angles[0] );
+		decoded.angles[1] = msg.ReadDeltaShort( base->angles[1] );
+		decoded.angles[2] = msg.ReadDeltaShort( base->angles[2] );
+	} else {
+		decoded.gameTime = msg.ReadLong();
+		decoded.buttons = msg.ReadShort();
+		decoded.mx = msg.ReadShort();
+		decoded.my = msg.ReadShort();
+		decoded.forwardmove = msg.ReadChar();
+		decoded.rightmove = msg.ReadChar();
+		decoded.upmove = msg.ReadChar();
+		decoded.angles[0] = msg.ReadShort();
+		decoded.angles[1] = msg.ReadShort();
+		decoded.angles[2] = msg.ReadShort();
+	}
+
+	if ( msg.IsReadOverflowed() ) {
+		return false;
+	}
+	cmd = decoded;
+	return true;
+}
+
+/*
+==================
+idAsyncNetwork::DuplicateUsercmd
+==================
+*/
+bool idAsyncNetwork::DuplicateUsercmd( const usercmd_t &previousUserCmd, usercmd_t &currentUserCmd, int frame, int time ) {
+
+	if ( currentUserCmd.gameTime <= previousUserCmd.gameTime ) {
+
+		currentUserCmd = previousUserCmd;
+		currentUserCmd.gameFrame = frame;
+		currentUserCmd.gameTime = time;
+		currentUserCmd.duplicateCount++;
+
+		if ( currentUserCmd.duplicateCount > MAX_USERCMD_DUPLICATION ) {
+			currentUserCmd.buttons &= ~BUTTON_ATTACK;
+			if ( abs( currentUserCmd.forwardmove ) > 2 ) currentUserCmd.forwardmove >>= 1;
+			if ( abs( currentUserCmd.rightmove ) > 2 ) currentUserCmd.rightmove >>= 1;
+			if ( abs( currentUserCmd.upmove ) > 2 ) currentUserCmd.upmove >>= 1;
+		}
+
+		return true;
+	}
+	return false;
+}
+
+/*
+==================
+idAsyncNetwork::UsercmdInputChanged
+==================
+*/
+bool idAsyncNetwork::UsercmdInputChanged( const usercmd_t &previousUserCmd, const usercmd_t &currentUserCmd ) {
+	return	previousUserCmd.buttons != currentUserCmd.buttons ||
+			previousUserCmd.forwardmove != currentUserCmd.forwardmove ||
+			previousUserCmd.rightmove != currentUserCmd.rightmove ||
+			previousUserCmd.upmove != currentUserCmd.upmove ||
+			previousUserCmd.angles[0] != currentUserCmd.angles[0] ||
+			previousUserCmd.angles[1] != currentUserCmd.angles[1] ||
+			previousUserCmd.angles[2] != currentUserCmd.angles[2];
+}
+
+/*
+==================
+idAsyncNetwork::AreCheatsEnabled
+==================
+*/
+bool idAsyncNetwork::AreCheatsEnabled( void ) {
+	return allowCheats.GetBool() || svCheats.GetBool();
+}
+
+/*
+==================
+idAsyncNetwork::SetCheatsEnabled
+==================
+*/
+void idAsyncNetwork::SetCheatsEnabled( bool enabled ) {
+	allowCheats.SetBool( enabled );
+	svCheats.SetBool( enabled );
+}
+
+/*
+==================
+idAsyncNetwork::AbandonDeferredDedicatedSpawn
+==================
+*/
+void idAsyncNetwork::AbandonDeferredDedicatedSpawn( void ) {
+	dedicatedSpawnDeferred = false;
+}
+
+/*
+==================
+idAsyncNetwork::SpawnServer_f
+
+With net_serverDedicated 1, a client showing a window turns itself into a
+dedicated server here, as retail Quake4.exe 1.4.2 does: the window closes, the
+system console becomes the server's only interface, and the audio device is
+released. Before that the spawn may have to swap to game_mp, or reload the engine
+out of q4xbase. The renderer reads net_serverDedicated as it starts, and a client
+must come back from that reload with its window to be converted here, so the
+request is held back across it and resumed by the spawnServer it replays. An
+engine that starts with net_serverDedicated 1 and no device is a dedicated server
+already: its session has worlds and no menus, as openQ4-ded's does, so a later
+engine reload (a map change's, or a bare reloadEngine) keeps it one.
+==================
+*/
+void idAsyncNetwork::SpawnServer_f( const idCmdArgs &args ) {
+	if ( dedicatedSpawnDeferred ) {
+		dedicatedSpawnDeferred = false;
+		serverDedicated.SetInteger( 1 );
+	}
+	const bool holdDedicatedAcrossReload = serverDedicated.GetInteger() == 1 && renderSystem->IsOpenGLRunning();
+
+    if ( !idStr::Icmp( fileSystem->GetActiveGameDir(), "q4xbase" ) ||
+         !idStr::Icmp( cvarSystem->GetCVarString( "fs_game" ), "q4xbase" ) ) {
+        const idStr requestedGameType = cvarSystem->GetCVarString( "si_gameType" );
+        common->StartupVariable( "si_gameType", true );
+        cvarSystem->SetCVarString( "si_gameType", requestedGameType.c_str() );
+        cvarSystem->SetCVarString( "fs_game", OPENQ4_GAMEDIR );
+        cvarSystem->SetCVarString( "fs_game_base", "" );
+        if ( !idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) )
+            cvarSystem->SetCVarString( "si_gameType", "DM" );
+        cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+        if ( holdDedicatedAcrossReload ) {
+            dedicatedSpawnDeferred = true;
+            serverDedicated.SetInteger( 0 );
+        }
+        cmdSystem->SetupReloadEngineMenu( args );
+        return;
+    }
+
+	if(args.Argc() > 1) {
+		cvarSystem->SetCVarString("si_map", args.Argv(1));
+	}
+
+	// Arena is an offline campaign presented under Single Player, but its
+	// bots are real multiplayer clients.  Re-apply the authored match settings
+	// here so late CVAR_GAME registration during the game_mp swap cannot lose
+	// them.
+	if ( !arenaCampaign.PrepareServer() ) {
+		arenaCampaign.ReportStartFailure();
+		return;
+	}
+
+	// don't let a server spawn with singleplayer game type - it will crash
+	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
+		cvarSystem->SetCVarString( "si_gameType", "DM" );
+	}
+
+	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
+	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+		idCmdArgs reloadArgs;
+		reloadArgs.AppendArg( "spawnServer" );
+		if ( args.Argc() > 1 ) {
+			reloadArgs.AppendArg( args.Argv( 1 ) );
+		}
+		if ( holdDedicatedAcrossReload ) {
+			dedicatedSpawnDeferred = true;
+			serverDedicated.SetInteger( 0 );
+		}
+		cmdSystem->SetupReloadGameModule( reloadArgs );
+		return;
+	}
+
+#ifndef ID_DEDICATED
+	// An engine that starts with net_serverDedicated 1 gets its session worlds
+	// without a renderer device, as openQ4-ded's does. One that starts without
+	// a device otherwise (com_skipRenderer, or a display recovery that left
+	// none) gets no worlds, and a map cannot load: refuse here instead of
+	// crashing in the map change.
+	if ( session->rw == NULL ) {
+		common->Warning( "spawnServer: the session has no game world, because this engine started without a renderer device; set net_serverDedicated 1 and reload the engine to host a dedicated server" );
+		return;
+	}
+#endif
+
+	com_asyncInput.SetBool( false );
+	// make sure the current system state is compatible with net_serverDedicated
+	switch ( cvarSystem->GetCVarInteger( "net_serverDedicated" ) ) {
+		case 0:
+		case 2:
+			if ( !renderSystem->IsOpenGLRunning() ) {
+				common->Warning( "OpenGL is not running, net_serverDedicated == %d", cvarSystem->GetCVarInteger( "net_serverDedicated" ) );
+			}
+			break;
+		case 1:
+			if ( renderSystem->IsOpenGLRunning() ) {
+				common->Printf( "Dedicated server: closing the game window; this console now runs the server, and closing it quits\n" );
+				// The console is the server's only window from here on, so closing
+				// it quits, as it does for openQ4-ded. A launch with a hidden game
+				// window keeps the console hidden too.
+				Sys_ShowConsole( cvarSystem->GetCVarBool( "r_hiddenWindow" ) ? 0 : 1, true );
+				renderSystem->ShutdownOpenGL();
+				// A dedicated server takes no single-instance lock (openQ4-ded never
+				// does), so the game can start again on this computer to join it.
+				Sys_ReleaseInstanceLock();
+			}
+			// Release the audio device only, as retail does. Shutdown() deleted
+			// every sample while sound shaders, emitters and BSE effects still
+			// pointed at them.
+			soundSystem->SetMute( true );
+			soundSystem->ShutdownHW();
+			break;
+	}
+	// use serverMapRestart if we already have a running server
+	if ( server.IsActive() ) {
+		cmdSystem->BufferCommandText( CMD_EXEC_NOW, "serverMapRestart" );
+	} else {
+		server.Spawn();
+	}
+
+	if ( com_WriteSingleDeclFile.GetBool() ) {
+		declManager->WriteDeclFile();
+	}
+
+	arenaCampaign.PopulateBots();
+}
+
+/*
+==================
+idAsyncNetwork::NextMap_f
+==================
+*/
+void idAsyncNetwork::NextMap_f( const idCmdArgs &args ) {
+	server.ExecuteMapChange();
+}
+
+/*
+==================
+idAsyncNetwork::Connect_f
+==================
+*/
+/*
+==================
+Net_AddressArgument
+
+The command tokenizer treats '[', ']' and '%' as punctuation, and only glues a
+":port" suffix onto a dotted quad, so an unquoted IPv6 endpoint reaches a
+command split across several arguments: "[2001:db8::1]:27650" arrives as
+'[' '2001' ':' 'db8' '::' '1' ']' ':' '27650'. A network address never contains
+a space, so concatenating the arguments recovers exactly what the user typed,
+and a quoted address - which arrives as a single token - passes through
+unchanged.
+==================
+*/
+static idStr Net_AddressArgument( const idCmdArgs &args ) {
+	idStr address;
+	for ( int i = 1; i < args.Argc(); i++ ) {
+		address += args.Argv( i );
+	}
+	return address;
+}
+
+void idAsyncNetwork::Connect_f( const idCmdArgs &args ) {
+
+    if ( !idStr::Icmp( fileSystem->GetActiveGameDir(), "q4xbase" ) ||
+         !idStr::Icmp( cvarSystem->GetCVarString( "fs_game" ), "q4xbase" ) ) {
+        const idStr requestedGameType = cvarSystem->GetCVarString( "si_gameType" );
+        common->StartupVariable( "si_gameType", true );
+        cvarSystem->SetCVarString( "si_gameType", requestedGameType.c_str() );
+        cvarSystem->SetCVarString( "fs_game", OPENQ4_GAMEDIR );
+        cvarSystem->SetCVarString( "fs_game_base", "" );
+        if ( !idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) )
+            cvarSystem->SetCVarString( "si_gameType", "DM" );
+        cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+        cmdSystem->SetupReloadEngineMenu( args );
+        return;
+    }
+	if ( server.IsActive() ) {
+		common->Printf( "already running a server\n" );
+		return;
+	}
+	const idStr serverName = Net_AddressArgument( args );
+	if ( serverName.IsEmpty() ) {
+		common->Printf( "USAGE: connect <serverName>\n" );
+		return;
+	}
+	// Select a deterministic provisional mode before any required game-module
+	// reload. LoadGameDLL repeats this guard after archived config replay so the
+	// client and server agree before serverInfo arrives.
+	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
+		cvarSystem->SetCVarString( "si_gameType", "DM" );
+	}
+
+	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
+	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+		idCmdArgs reloadArgs;
+		reloadArgs.AppendArg( "connect" );
+		// One argument, so the replayed command survives re-tokenization.
+		reloadArgs.AppendArg( serverName.c_str() );
+		cmdSystem->SetupReloadGameModule( reloadArgs );
+		return;
+	}
+
+	com_asyncInput.SetBool( false );
+	client.ConnectToServer( serverName.c_str() );
+}
+
+/*
+==================
+idAsyncNetwork::Reconnect_f
+==================
+*/
+void idAsyncNetwork::Reconnect_f( const idCmdArgs &args ) {
+	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
+		cvarSystem->SetCVarString( "si_gameType", "DM" );
+	}
+	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
+	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+		idCmdArgs reloadArgs;
+		reloadArgs.AppendArg( "reconnect" );
+		cmdSystem->SetupReloadGameModule( reloadArgs );
+		return;
+	}
+
+	client.Reconnect();
+}
+
+/*
+==================
+idAsyncNetwork::GetServerInfo_f
+==================
+*/
+void idAsyncNetwork::GetServerInfo_f( const idCmdArgs &args ) {
+	client.GetServerInfo( Net_AddressArgument( args ).c_str() );
+}
+
+/*
+==================
+idAsyncNetwork::GetLANServers_f
+==================
+*/
+void idAsyncNetwork::GetLANServers_f( const idCmdArgs &args ) {
+	client.GetLANServers();
+}
+
+/*
+==================
+idAsyncNetwork::ListServers_f
+==================
+*/
+void idAsyncNetwork::ListServers_f( const idCmdArgs &args ) {
+	client.ListServers();
+}
+
+/*
+==================
+idAsyncNetwork::RemoteConsole_f
+==================
+*/
+void idAsyncNetwork::RemoteConsole_f( const idCmdArgs &args ) {
+	client.RemoteConsole( args.Args() );
+}
+
+/*
+==================
+idAsyncNetwork::Heartbeat_f
+==================
+*/
+void idAsyncNetwork::Heartbeat_f( const idCmdArgs &args ) {
+	if ( !server.IsActive() ) {
+		common->Printf( "server is not running\n" );
+		return;
+	}
+	server.MasterHeartbeat( true );
+}
+
+/*
+==================
+idAsyncNetwork::Kick_f
+==================
+*/
+void idAsyncNetwork::Kick_f( const idCmdArgs &args ) {
+	idStr clientId;
+	int iclient;
+
+	if ( !server.IsActive() ) {
+		common->Printf( "server is not running\n" );
+		return;
+	}
+
+	clientId = args.Argv( 1 );
+	if ( !clientId.IsNumeric() ) {
+		common->Printf( "usage: kick <client number>\n" );
+		return;
+	}
+	iclient = atoi( clientId );
+
+	// openQ4: DropClient indexes the client array before it validates anything, so a
+	// typo'd client number used to be an out of bounds access rather than a usage error.
+	if ( iclient < 0 || iclient >= MAX_ASYNC_CLIENTS ) {
+		common->Printf( "usage: kick <client number>, must be in the range 0 - %d\n", MAX_ASYNC_CLIENTS - 1 );
+		return;
+	}
+
+	if ( server.GetLocalClientNum() == iclient ) {
+		common->Printf( "can't kick the host\n" );
+		return;
+	}
+
+	server.DropClient( iclient, "#str_07134" );
+}
+
+/*
+==================
+idAsyncNetwork::GetNETServers
+==================
+*/
+void idAsyncNetwork::GetNETServers( ) {
+	client.GetNETServers();
+}
+
+/*
+==================
+idAsyncNetwork::CheckNewVersion_f
+==================
+*/
+void idAsyncNetwork::CheckNewVersion_f( const idCmdArgs &args ) {
+	client.SendVersionCheck(); 
+}
+
+/*
+==================
+idAsyncNetwork::ExecuteSessionCommand
+==================
+*/
+void idAsyncNetwork::ExecuteSessionCommand( const char *sessCmd ) {
+	if ( sessCmd[ 0 ] ) {
+		if ( server.IsActive() && !idStr::Icmp( sessCmd, "nextMap" ) ) {
+			// The game has already selected si_map. Defer the engine map load
+			// until this simulation frame has returned and released its world.
+			cmdSystem->BufferCommandText( CMD_EXEC_INSERT, "nextMap\n" );
+			return;
+		}
+		if ( !idStr::Icmp( sessCmd, "game_startmenu" ) ) {
+			session->SetGUI( game->StartMenu(), NULL );
+			return;
+		}
+
+		idCmdArgs args;
+		args.TokenizeString( sessCmd, false );
+		if ( args.Argc() > 0 && !idStr::Icmp( args.Argv( 0 ), "arenaComplete" ) ) {
+			arenaCampaign.QueueCompletion( args );
+		}
+	}
+}
+
+/*
+=================
+idAsyncNetwork::UpdateUI_f
+=================
+*/
+void idAsyncNetwork::UpdateUI_f( const idCmdArgs &args ) {
+	if ( args.Argc() != 2 ) {
+		common->Warning( "idAsyncNetwork::UpdateUI_f: wrong arguments\n" );
+		return;
+	}
+	if ( !server.IsActive() ) {
+		common->Warning( "idAsyncNetwork::UpdateUI_f: server is not active\n" );
+		return;
+	}
+	int clientNum = atoi( args.Args( 1 ) );
+	server.UpdateUI( clientNum );
+}
+
+/*
+===============
+idAsyncNetwork::BuildInvalidKeyMsg
+===============
+*/
+void idAsyncNetwork::BuildInvalidKeyMsg( idStr &msg, bool valid[ 2 ] ) {
+	if ( !valid[ 0 ] ) {
+		msg += common->GetLanguageDict()->GetString( "#str_07194" );
+	}
+	if ( fileSystem->HasD3XP() && !valid[ 1 ] ) {
+		if ( msg.Length() ) {
+			msg += "\n";
+		}
+		msg += common->GetLanguageDict()->GetString( "#str_07195" );
+	}
+	msg += "\n";
+	msg += common->GetLanguageDict()->GetString( "#str_04304" );	
+}
+

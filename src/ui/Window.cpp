@@ -1,0 +1,6411 @@
+/*
+===========================================================================
+
+Doom 3 GPL Source Code
+Copyright (C) 1999-2011 id Software LLC, a ZeniMax Media company. 
+
+This file is part of the Doom 3 GPL Source Code (?Doom 3 Source Code?).  
+
+Doom 3 Source Code is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Doom 3 Source Code is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Doom 3 Source Code.  If not, see <http://www.gnu.org/licenses/>.
+
+In addition, the Doom 3 Source Code is also subject to certain additional terms. You should have received a copy of these additional terms immediately following the terms and conditions of the GNU General Public License which accompanied the Doom 3 Source Code.  If not, please request a copy in writing from id Software at the address below.
+
+If you have questions concerning this license or the applicable additional terms, you may contact in writing id Software LLC, c/o ZeniMax Media Inc., Suite 120, Rockville, Maryland 20850 USA.
+
+===========================================================================
+*/
+
+
+
+
+#include "DeviceContext.h"
+#include "Window.h"
+#include "LegacyGuiImport.h"
+#include "UserInterfaceLocal.h"
+#include "RetainedHud.h"
+#include "LegacyGuiLayout.h"
+#include "AudioGraph.h"
+#include "../framework/Session.h"
+#include "../framework/SaveGameReleases.h"
+#include "../idlib/SaveCodec.h"
+#include "EditWindow.h"
+#include "ChoiceWindow.h"
+#include "SliderWindow.h"
+#include "BindWindow.h"
+#include "ListWindow.h"
+#include "RenderWindow.h"
+#include "LevelEditorWindow.h"
+#include "MarkerWindow.h"
+#include "FieldWindow.h"
+
+#include "GameSSDWindow.h"
+#include "GameBearShootWindow.h"
+#include "GameBustOutWindow.h"
+
+// 
+//  gui editor is more integrated into the window now
+#include "../tools/guied/GEWindowWrapper.h"
+
+namespace {
+static bool IsFullscreenBackdropRect( const idRectangle &drawRect ) {
+	const float epsilon = 0.01f;
+	if ( idMath::Fabs( drawRect.x ) > epsilon || idMath::Fabs( drawRect.y ) > epsilon ||
+		 idMath::Fabs( drawRect.w - 640.0f ) > epsilon ) {
+		return false;
+	}
+	// Some intro videos are authored as 640x479.
+	return idMath::Fabs( drawRect.h - 480.0f ) <= 1.01f;
+}
+
+static bool ShouldDrawCinematicUnderlay( const idMaterial *background, const idRectangle &drawRect ) {
+	if ( background == NULL || !IsFullscreenBackdropRect( drawRect ) ) {
+		return false;
+	}
+
+	const char *materialName = background->GetName();
+	const bool isVideoMaterial = ( materialName != NULL && idStr::Icmpn( materialName, "video/", 6 ) == 0 );
+	return isVideoMaterial || ( background->CinematicLength() > 0 );
+}
+
+static bool ShouldDrawSplashUnderlay( const idMaterial *background, const idRectangle &drawRect ) {
+	if ( background == NULL || !IsFullscreenBackdropRect( drawRect ) ) {
+		return false;
+	}
+
+	const char *materialName = background->GetName();
+	if ( materialName == NULL || materialName[0] == '\0' ) {
+		return false;
+	}
+
+	return idStr::Icmp( materialName, "gfx/guis/mainmenu/splash" ) == 0 ||
+		idStr::Icmp( materialName, "gfx/guis/mainmenu/splash.dds" ) == 0 ||
+		idStr::Icmp( materialName, "gfx/splashScreen" ) == 0 ||
+		idStr::Icmp( materialName, "gfx/guis/loadscreens/generic" ) == 0 ||
+		idStr::Icmp( materialName, "gfx/guis/loadscreens/generic.dds" ) == 0;
+}
+
+static void DrawCinematicUnderlay( idDeviceContext *dc ) {
+	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
+	renderSystem->SetUseUIViewportFor2D( false );
+	renderSystem->SetColor( colorBlack );
+	renderSystem->DrawStretchPic( 0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, 1.0f, declManager->FindMaterial( "_white" ) );
+	renderSystem->SetColor( colorWhite );
+	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
+}
+
+static void DrawSplashUnderlay( idDeviceContext *dc ) {
+	const idVec4 underlayColor( 24.0f / 255.0f, 26.0f / 255.0f, 8.0f / 255.0f, 1.0f );
+	dc->DrawFilledRect( 0.0f, 0.0f, 640.0f, 480.0f, underlayColor );
+}
+
+static bool IsLegacyVehicleDamageOverlay( const idUserInterfaceLocal *gui, const char *windowName, const idMaterial *background, const idRectangle &drawRect ) {
+	if ( gui == NULL || background == NULL || windowName == NULL || !IsFullscreenBackdropRect( drawRect ) ) {
+		return false;
+	}
+
+	if ( idStr::Icmp( windowName, "damage" ) != 0 ) {
+		return false;
+	}
+
+	const char *materialName = background->GetName();
+	if ( materialName == NULL || idStr::Icmp( materialName, "gfx/guis/common/add_box2" ) != 0 ) {
+		return false;
+	}
+
+	const char *sourceFile = gui->GetSourceFile();
+	return idStr::Icmp( sourceFile, "guis/vehicles/hud.gui" ) == 0 ||
+		idStr::Icmp( sourceFile, "guis/vehicles/medchange.gui" ) == 0;
+}
+
+static bool ShouldDrawNativeScreenOverlay( const idUserInterfaceLocal *gui, const char *windowName, const idMaterial *background, const idRectangle &drawRect, int flags ) {
+	if ( ( flags & WIN_NATIVESCREENOVERLAY ) != 0 ) {
+		return IsFullscreenBackdropRect( drawRect );
+	}
+
+	// Preserve stock vehicle hit flashes across the full native render area even
+	// though the rest of the vehicle HUD remains constrained to the UI viewport.
+	return IsLegacyVehicleDamageOverlay( gui, windowName, background, drawRect );
+}
+
+static void DrawNativeScreenOverlay( const idMaterial *background, const idVec4 &matColor ) {
+	if ( background == NULL ) {
+		return;
+	}
+
+	const bool previousUIViewportMode = renderSystem->GetUseUIViewportFor2D();
+	renderSystem->SetUseUIViewportFor2D( false );
+	renderSystem->SetColor( matColor );
+	renderSystem->DrawStretchPic( 0.0f, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, 1.0f, background );
+	renderSystem->SetColor( colorWhite );
+	renderSystem->SetUseUIViewportFor2D( previousUIViewportMode );
+}
+
+static void AdjustTournamentWarmupLayout( const idUserInterfaceLocal *gui, const char *windowName, const char *parentName, float xofs, float xExpand, idRectangle &drawRect ) {
+	if ( gui == NULL || windowName == NULL || xExpand <= 0.0f ) {
+		return;
+	}
+
+	if ( idStr::Icmp( gui->GetSourceFile(), "guis/mphud.gui" ) != 0 ) {
+		return;
+	}
+
+	// Stretch the tournament pre-game bar across the native render width while
+	// keeping its title centered in the middle 640-wide virtual HUD canvas.
+	if ( idStr::Icmp( windowName, "tourn_warmupbar" ) == 0 || idStr::Icmp( windowName, "d_tourn_warmupbar" ) == 0 ) {
+		drawRect.x = xofs - xExpand;
+		drawRect.w = 640.0f + ( xExpand * 2.0f );
+		return;
+	}
+
+	if ( parentName != NULL && idStr::Icmp( parentName, "tourn_warmupbar" ) == 0 &&
+		 idStr::Icmp( windowName, "tourn_warmup_title" ) == 0 ) {
+		drawRect.x = xofs + xExpand;
+		drawRect.w = 640.0f;
+	}
+}
+
+static rvNamedEvent *openQ4_CreateLegacyCinematicNamedEvent( idWindow *window, const char *eventName ) {
+	if ( window == NULL || window->GetGui() == NULL ) {
+		return NULL;
+	}
+
+	if ( idStr::Icmp( window->GetGui()->GetSourceFile(), "guis/cinematic.gui" ) != 0 ||
+		 idStr::Icmp( eventName, "showLetterbox" ) != 0 ) {
+		return NULL;
+	}
+
+	static const char legacyShowLetterboxScript[] =
+		"{ "
+		"set \"blackbar_top::visible\" \"1\"; "
+		"set \"blackbar_bottom::visible\" \"1\"; "
+		"set \"blackbar_left::visible\" \"1\"; "
+		"set \"blackbar_right::visible\" \"1\"; "
+		"set \"anim_bars::visible\" \"1\"; "
+		"}";
+
+	idParser src( legacyShowLetterboxScript, sizeof( legacyShowLetterboxScript ) - 1,
+		"legacy_cinematic_showLetterbox",
+		LEXFL_NOFATALERRORS | LEXFL_NOSTRINGCONCAT | LEXFL_ALLOWMULTICHARLITERALS | LEXFL_ALLOWBACKSLASHSTRINGCONCAT );
+
+	rvNamedEvent *event = new rvNamedEvent( eventName );
+	if ( !window->ParseScript( &src, *event->mEvent ) ) {
+		delete event;
+		return NULL;
+	}
+	event->mEvent->FixupParms( window );
+
+	return event;
+}
+
+static bool TranslateControllerMenuKey( const sysEvent_t *sourceEvent, sysEvent_t &translatedEvent, int &focusDirection ) {
+	if ( sourceEvent == NULL || sourceEvent->evType != SE_KEY ) {
+		return false;
+	}
+
+	translatedEvent = *sourceEvent;
+	focusDirection = 0;
+
+	// Confirm and Back may trade the south and east buttons (section 13.5).
+	switch ( idKeyInput::MenuControllerKey( sourceEvent->evValue ) ) {
+		case K_JOY1:
+			translatedEvent.evValue = K_PGUP;
+			return true;
+		case K_JOY2:
+			translatedEvent.evValue = K_PGDN;
+			return true;
+		case K_JOY3:
+			translatedEvent.evValue = K_ENTER;
+			return true;
+		case K_JOY4:
+		case K_JOY7:
+		case K_JOY8:
+			translatedEvent.evValue = K_ESCAPE;
+			return true;
+		case K_JOY9:
+			translatedEvent.evValue = K_UPARROW;
+			focusDirection = -1;
+			return true;
+		case K_JOY10:
+			translatedEvent.evValue = K_DOWNARROW;
+			focusDirection = 1;
+			return true;
+		case K_JOY11:
+			translatedEvent.evValue = K_RIGHTARROW;
+			focusDirection = 1;
+			return true;
+		case K_JOY12:
+			translatedEvent.evValue = K_LEFTARROW;
+			focusDirection = -1;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool WindowConsumesDirectionalNavigation( idWindow *window, int key ) {
+	if ( window == NULL ) {
+		return false;
+	}
+
+	if ( dynamic_cast<idChoiceWindow *>( window ) != NULL || dynamic_cast<idSliderWindow *>( window ) != NULL ) {
+		return key == K_LEFTARROW || key == K_KP_LEFTARROW || key == K_RIGHTARROW || key == K_KP_RIGHTARROW;
+	}
+
+	if ( dynamic_cast<idListWindow *>( window ) != NULL ) {
+		return key == K_UPARROW || key == K_KP_UPARROW || key == K_DOWNARROW || key == K_KP_DOWNARROW ||
+			key == K_PGUP || key == K_PGDN;
+	}
+
+	if ( dynamic_cast<idEditWindow *>( window ) != NULL ) {
+		return key == K_LEFTARROW || key == K_KP_LEFTARROW || key == K_RIGHTARROW || key == K_KP_RIGHTARROW ||
+			key == K_UPARROW || key == K_KP_UPARROW || key == K_DOWNARROW || key == K_KP_DOWNARROW ||
+			key == K_HOME || key == K_END || key == K_DEL || key == K_INS || key == K_BACKSPACE;
+	}
+
+	return false;
+}
+
+static bool WindowHasNativeEnterHandling( idWindow *window ) {
+	return dynamic_cast<idBindWindow *>( window ) != NULL ||
+		dynamic_cast<idEditWindow *>( window ) != NULL ||
+		dynamic_cast<idListWindow *>( window ) != NULL;
+}
+
+static void CollectFocusWindows( idWindow *window, idList<idWindow *> &candidates ) {
+	for ( int i = 0; i < window->GetChildCount(); ++i ) {
+		idWindow *child = window->GetChild( i );
+		if ( child == NULL || !child->IsVisible() || child->HasNoEvents() ) {
+			continue;
+		}
+		if ( child->GetFlags() & WIN_CANFOCUS ) {
+			candidates.Append( child );
+		} else {
+			CollectFocusWindows( child, candidates );
+		}
+	}
+}
+
+static bool NavigateFocus( idWindow *window, int direction, bool runHoverScripts = false ) {
+	if ( window == NULL || direction == 0 ) {
+		return false;
+	}
+
+	// Build one visible traversal order in both directions. Hidden pages can
+	// retain focus, and walking their parents used to trap navigation there.
+	idList<idWindow *> candidates;
+	CollectFocusWindows( window, candidates );
+	if ( candidates.Num() == 0 ) {
+		return false;
+	}
+	idWindow *currentFocus = window->GetFocusedChild();
+	const int currentIndex = candidates.FindIndex( currentFocus );
+	const int nextIndex = currentIndex < 0
+		? ( direction < 0 ? candidates.Num() - 1 : 0 )
+		: ( currentIndex + ( direction < 0 ? -1 : 1 ) + candidates.Num() ) % candidates.Num();
+	idWindow *nextFocus = candidates[ nextIndex ];
+	if ( nextFocus != currentFocus ) {
+		window->SetFocus( nextFocus, false );
+		if ( runHoverScripts ) {
+			if ( currentFocus != NULL ) {
+				currentFocus->MouseExit();
+			}
+			nextFocus->MouseEnter();
+		}
+	}
+	return true;
+}
+}
+
+bool idWindow::registerIsTemporary[MAX_EXPRESSION_REGISTERS];		// statics to assist during parsing
+//float idWindow::shaderRegisters[MAX_EXPRESSION_REGISTERS];
+//wexpOp_t idWindow::shaderOps[MAX_EXPRESSION_OPS];
+
+idCVar idWindow::gui_debug( "gui_debug", "0", CVAR_GUI | CVAR_BOOL, "" );
+idCVar idWindow::gui_edit( "gui_edit", "0", CVAR_GUI | CVAR_BOOL, "" );
+extern idCVar gui_debugScript;
+
+extern idCVar r_skipGuiShaders;		// 1 = don't render any gui elements on surfaces
+
+//  made RegisterVars a member of idWindow
+const idRegEntry idWindow::RegisterVars[] = {
+	{ "forecolor", idRegister::VEC4 },
+	{ "forecolor_r", idRegister::FLOAT },
+	{ "forecolor_g", idRegister::FLOAT },
+	{ "forecolor_b", idRegister::FLOAT },
+	{ "forecolor_w", idRegister::FLOAT },
+	{ "hovercolor", idRegister::VEC4 },
+	{ "hovercolor_r", idRegister::FLOAT },
+	{ "hovercolor_g", idRegister::FLOAT },
+	{ "hovercolor_b", idRegister::FLOAT },
+	{ "hovercolor_w", idRegister::FLOAT },
+	{ "backcolor", idRegister::VEC4 },
+	{ "backcolor_r", idRegister::FLOAT },
+	{ "backcolor_g", idRegister::FLOAT },
+	{ "backcolor_b", idRegister::FLOAT },
+	{ "backcolor_w", idRegister::FLOAT },
+	{ "bordercolor", idRegister::VEC4 },
+	{ "bordercolor_r", idRegister::FLOAT },
+	{ "bordercolor_g", idRegister::FLOAT },
+	{ "bordercolor_b", idRegister::FLOAT },
+	{ "bordercolor_w", idRegister::FLOAT },
+	{ "rect", idRegister::RECTANGLE },
+	{ "matcolor", idRegister::VEC4 },
+	{ "matcolor_r", idRegister::FLOAT },
+	{ "matcolor_g", idRegister::FLOAT },
+	{ "matcolor_b", idRegister::FLOAT },
+	{ "matcolor_w", idRegister::FLOAT },
+	{ "scale", idRegister::VEC2 },
+	{ "translate", idRegister::VEC2 },
+	{ "rotate", idRegister::FLOAT },
+	{ "textscale", idRegister::FLOAT },
+	{ "visible", idRegister::BOOL },
+	{ "noevents", idRegister::BOOL },
+	{ "text", idRegister::STRING },
+	{ "background", idRegister::STRING },
+	{ "runscript", idRegister::STRING },
+	{ "varbackground", idRegister::STRING },
+	{ "cvar", idRegister::STRING },
+	{ "choices", idRegister::STRING },
+	{ "values", idRegister::STRING },
+	{ "choiceVar", idRegister::STRING },
+	{ "gui", idRegister::STRING },
+	{ "bind", idRegister::STRING },
+	// Render window properties must stay register-backed so gui:: bindings update correctly.
+	{ "model", idRegister::STRING },
+	{ "anim", idRegister::STRING },
+	{ "animClass", idRegister::STRING },
+	{ "modelRotate", idRegister::VEC4 },
+	{ "modelOrigin", idRegister::VEC4 },
+	{ "lightOrigin", idRegister::VEC4 },
+	{ "lightColor", idRegister::VEC4 },
+	{ "viewOffset", idRegister::VEC4 },
+	{ "customShader", idRegister::STRING },
+	{ "skin", idRegister::STRING },
+	{ "model1", idRegister::STRING },
+	{ "joint1", idRegister::STRING },
+	{ "anim1", idRegister::STRING },
+	{ "animClass1", idRegister::STRING },
+	{ "model2", idRegister::STRING },
+	{ "joint2", idRegister::STRING },
+	{ "anim2", idRegister::STRING },
+	{ "animClass2", idRegister::STRING },
+	{ "lightOrigin0", idRegister::VEC4 },
+	{ "lightColor0", idRegister::VEC4 },
+	{ "lightOrigin1", idRegister::VEC4 },
+	{ "lightColor1", idRegister::VEC4 },
+	{ "lightOrigin2", idRegister::VEC4 },
+	{ "lightColor2", idRegister::VEC4 },
+	{ "lightOrigin3", idRegister::VEC4 },
+	{ "lightColor3", idRegister::VEC4 },
+	{ "lightOrigin4", idRegister::VEC4 },
+	{ "lightColor4", idRegister::VEC4 },
+	{ "hideCursor", idRegister::BOOL},
+	{ "maxchars", idRegister::INT},
+	{ "backgroundHover", idRegister::STRING },
+	{ "backgroundFocus", idRegister::STRING },
+	{ "backgroundLine", idRegister::STRING },
+	{ "backgroundGreyed", idRegister::STRING },
+	{ "itemheight", idRegister::INT },
+};
+
+const int idWindow::NumRegisterVars = sizeof(RegisterVars) / sizeof(idRegEntry);
+
+const char *idWindow::ScriptNames[] = {
+	"onMouseEnter",
+	"onMouseExit",
+	"onAction",
+	"onActivate",
+	"onDeactivate",
+	"onESC",
+	"onEvent",
+	"onTrigger",
+	"onActionRelease",
+	"onEnter",
+	"onEnterRelease",
+// jmarshall - quake 4
+	"onBackAction",
+	"onTabRelease",
+	"onGainFocus",
+	"onLoseFocus",
+	"onSelChange",
+	"onInit",
+	"onJoyStart",
+	"onJoySelect",
+	"onJoyBack",
+	"onJoyLShoulder",
+	"onJoyRShoulder",
+	"onJoyUp",
+	"onJoyDown",
+	"onJoyLeft",
+	"onJoyRight",
+	"onJoyButton1",
+	"onJoyButton2",
+	"onJoyBackButton"
+// jmarshall end
+};
+
+static bool ParseScreenAlignXToken( const idToken &token, unsigned char &outAlign ) {
+	if ( token.IsNumeric() ) {
+		outAlign = static_cast<unsigned char>( idMath::ClampInt( idWindow::SCREEN_ALIGN_X_MIDDLE, idWindow::SCREEN_ALIGN_X_RIGHT, atoi( token.c_str() ) ) );
+		return true;
+	}
+	if ( token.Icmp( "middle" ) == 0 || token.Icmp( "center" ) == 0 || token.Icmp( "default" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_X_MIDDLE;
+		return true;
+	}
+	if ( token.Icmp( "left" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_X_LEFT;
+		return true;
+	}
+	if ( token.Icmp( "right" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_X_RIGHT;
+		return true;
+	}
+	return false;
+}
+
+static bool ParseScreenAlignYToken( const idToken &token, unsigned char &outAlign ) {
+	if ( token.IsNumeric() ) {
+		outAlign = static_cast<unsigned char>( idMath::ClampInt( idWindow::SCREEN_ALIGN_Y_MIDDLE, idWindow::SCREEN_ALIGN_Y_BOTTOM, atoi( token.c_str() ) ) );
+		return true;
+	}
+	if ( token.Icmp( "middle" ) == 0 || token.Icmp( "center" ) == 0 || token.Icmp( "default" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_Y_MIDDLE;
+		return true;
+	}
+	if ( token.Icmp( "top" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_Y_TOP;
+		return true;
+	}
+	if ( token.Icmp( "bottom" ) == 0 ) {
+		outAlign = idWindow::SCREEN_ALIGN_Y_BOTTOM;
+		return true;
+	}
+	return false;
+}
+
+/*
+================
+idWindow::CommonInit
+================
+*/
+void idWindow::CommonInit() {
+	// An off-screen GUI can be saved before CalcRects/Redraw ever runs.
+	actualX = actualY = 0.0f;
+	childID = 0;
+	flags = 0;
+	lastTimeRun = 0;
+	origin.Zero();
+	fontNum = 0;
+	timeLine = -1;
+	xOffset = yOffset = 0.0;
+	cursor = 0;
+	forceAspectWidth = 640;
+	forceAspectHeight = 480;
+	matScalex = 1;
+	matScaley = 1;
+	borderSize = 0;
+	noTime = false;
+	visible = true;
+	alwaysThink = false;
+	textAlign = 0;
+	textAlignx = 0;
+	textAligny = 0;
+	screenAlignX = SCREEN_ALIGN_X_MIDDLE;
+	screenAlignY = SCREEN_ALIGN_Y_MIDDLE;
+	noEvents = false;
+	rotate = 0;
+	shear.Zero();
+	textScale = 0.35f;
+	textspacing = 0.0f;
+	textstyle = 0.0f;
+	backColor.Zero();
+	foreColor = idVec4(1, 1, 1, 1);
+	hoverColor = idVec4(1, 1, 1, 1);
+	matColor = idVec4(1, 1, 1, 1);
+	borderColor.Zero();
+	background = NULL;
+	backGroundName = "";
+	focusedChild = NULL;
+	captureChild = NULL;
+	overChild = NULL;
+	parent = NULL;
+	saveOps = NULL;
+	saveRegs = NULL;
+	timeLine = -1;
+	textShadow = 0;
+	hover = false;
+
+	for (int i = 0; i < SCRIPT_COUNT; i++) {
+		scripts[i] = NULL;
+	}
+
+	hideCursor = false;
+
+	ops.clear();
+	numOps = 0;
+
+	backColor_r.Bind(backColor, 0);
+	backColor_g.Bind(backColor, 1);
+	backColor_b.Bind(backColor, 2);
+	backColor_w.Bind(backColor, 3);
+	matColor_r.Bind(matColor, 0);
+	matColor_g.Bind(matColor, 1);
+	matColor_b.Bind(matColor, 2);
+	matColor_w.Bind(matColor, 3);
+	foreColor_r.Bind(foreColor, 0);
+	foreColor_g.Bind(foreColor, 1);
+	foreColor_b.Bind(foreColor, 2);
+	foreColor_w.Bind(foreColor, 3);
+	hoverColor_r.Bind(hoverColor, 0);
+	hoverColor_g.Bind(hoverColor, 1);
+	hoverColor_b.Bind(hoverColor, 2);
+	hoverColor_w.Bind(hoverColor, 3);
+	borderColor_r.Bind(borderColor, 0);
+	borderColor_g.Bind(borderColor, 1);
+	borderColor_b.Bind(borderColor, 2);
+	borderColor_w.Bind(borderColor, 3);
+// jmarshall end
+}
+
+/*
+================
+idWindow::Size
+================
+*/
+size_t idWindow::Size() {
+	int c = children.Num();
+	size_t sz = 0;
+	for (int i = 0; i < c; i++) {
+		sz += children[i]->Size();
+	}
+	sz += sizeof(*this) + Allocated();
+	return sz;
+}
+
+/*
+================
+idWindow::Allocated
+================
+*/
+size_t idWindow::Allocated() {
+	int i, c;
+	size_t sz = name.Allocated();
+	sz += ops.size() * sizeof( wexpOp_t );
+	sz += text.Size();
+	sz += backGroundName.Size();
+
+	c = definedVars.Num();
+	for (i = 0; i < c; i++) {
+		sz += definedVars[i]->Size();
+	}
+
+	for (i = 0; i < SCRIPT_COUNT; i++) {
+		if (scripts[i]) {
+			sz += scripts[i]->Size();
+		}
+	}
+	c = timeLineEvents.Num();
+	for (i = 0; i < c; i++) {
+		sz += timeLineEvents[i]->Size();
+	}
+
+	c = namedEvents.Num();
+	for (i = 0; i < c; i++) {
+		sz += namedEvents[i]->Size();
+	}
+
+	c = drawWindows.Num();
+	for (i = 0; i < c; i++) {
+		if (drawWindows[i].simp) {
+			sz += drawWindows[i].simp->Size();
+		}
+	}
+
+	return sz;
+}
+
+/*
+================
+idWindow::idWindow
+================
+*/
+idWindow::idWindow(idUserInterfaceLocal *ui) {
+	dc = NULL;
+	gui = ui;
+	CommonInit();
+}
+				  
+/*
+================
+idWindow::idWindow
+================
+*/
+idWindow::idWindow(idDeviceContext *d, idUserInterfaceLocal *ui) {
+	dc = d;
+	gui = ui;
+	CommonInit();
+}
+
+/*
+================
+idWindow::CleanUp
+================
+*/
+void idWindow::CleanUp() {
+	if ( gui != NULL ) {
+		idWindow *desktop = gui->GetDesktop();
+		if ( desktop != NULL && desktop != this ) {
+			desktop->ClearTrackedWindowReference( this );
+		}
+	}
+
+	int i, c = drawWindows.Num();
+	for (i = 0; i < c; i++) {
+		delete drawWindows[i].simp;
+	}
+
+	// ensure the register list gets cleaned up
+	regList.Reset ( );
+	
+	// Cleanup the named events
+	namedEvents.DeleteContents(true);
+
+	drawWindows.Clear();
+	children.DeleteContents(true);
+	definedVars.DeleteContents(true);
+	timeLineEvents.DeleteContents(true);
+// jmarshall
+	updateVars.Clear();
+// jmarshall end
+	for (i = 0; i < SCRIPT_COUNT; i++) {
+		delete scripts[i];
+	}
+	CommonInit();
+}
+
+/*
+================
+idWindow::~idWindow
+================
+*/
+idWindow::~idWindow() {
+	UI_LegacyObservationDestroyed(this);
+	CleanUp();
+}
+
+/*
+================
+idWindow::Move
+================
+*/
+void idWindow::Move(float x, float y) {
+	idRectangle rct = rect;
+	rct.x = x;
+	rct.y = y;
+	idRegister *reg = RegList()->FindReg("rect");
+	if (reg) {
+		reg->Enable(false);
+	}
+	rect = rct;
+}
+
+/*
+================
+idWindow::SetFont
+================
+*/
+void idWindow::SetFont() {
+	dc->SetFont(fontNum);
+}
+
+/*
+================
+idWindow::GetMaxCharHeight
+================
+*/
+float idWindow::GetMaxCharHeight() {
+	SetFont();
+	return dc->MaxCharHeight(textScale);
+}
+
+/*
+================
+idWindow::GetMaxCharWidth
+================
+*/
+float idWindow::GetMaxCharWidth() {
+	SetFont();
+	return dc->MaxCharWidth(textScale);
+}
+
+/*
+================
+idWindow::Draw
+================
+*/
+void idWindow::Draw( int time, float x, float y ) {
+	if ( text.Length() == 0 ) {
+		return;
+	}
+	const int textAdjust = static_cast<int>( textspacing );
+	const int style = static_cast<int>( textstyle );
+	const bool isChatWindow = ( flags & WIN_CHATWINDOW ) != 0;
+	dc->DrawText( text, textScale, textAlign, foreColor, textRect, !( flags & WIN_NOWRAP ), -1, false, NULL, 0, textAdjust, style, isChatWindow );
+
+	if ( gui_edit.GetBool() ) {
+		dc->EnableClipping( false );
+		dc->DrawText( va( "x: %i  y: %i", ( int )rect.x(), ( int )rect.y() ), 0.25, 0, dc->colorWhite, idRectangle( rect.x(), rect.y() - 15, 100, 20 ), false );
+		dc->DrawText( va( "w: %i  h: %i", ( int )rect.w(), ( int )rect.h() ), 0.25, 0, dc->colorWhite, idRectangle( rect.x() + rect.w(), rect.w() + rect.h() + 5, 100, 20 ), false );
+		dc->EnableClipping( true );
+	}
+
+}
+
+/*
+================
+idWindow::BringToTop
+================
+*/
+void idWindow::BringToTop(idWindow *w) {
+	
+	if (w && !(w->flags & WIN_MODAL)) {
+		return;
+	}
+
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		if (children[i] == w) {
+			// this is it move from i - 1 to 0 to i to 1 then shove this one into 0
+			for (int j = i+1; j < c; j++) {
+				children[j-1] = children[j];
+			}
+			children[c-1] = w;
+			break;
+		}
+	}
+}
+
+/*
+================
+idWindow::Size
+================
+*/
+void idWindow::Size(float x, float y, float w, float h) {
+	idRectangle rct = rect;
+	rct.x = x;
+	rct.y = y;
+	rct.w = w;
+	rct.h = h;
+	rect = rct;
+	CalcClientRect(0,0);
+}
+
+/*
+================
+idWindow::MouseEnter
+================
+*/
+void idWindow::MouseEnter() {
+	
+	if (noEvents) {
+		return;
+	}
+
+	RunScript(ON_MOUSEENTER);
+}
+
+/*
+================
+idWindow::MouseExit
+================
+*/
+void idWindow::MouseExit() {
+	
+	if (noEvents) {
+		return;
+	}
+
+	RunScript(ON_MOUSEEXIT);
+}
+
+void idWindow::ClearMouseHover() {
+	// Hover is a path through nested containers, independent of focusedChild.
+	// Clear the whole path so an old mouse highlight cannot outlive takeover.
+	for ( int i = 0; i < children.Num(); ++i ) {
+		children[i]->ClearMouseHover();
+	}
+	hover = false;
+	if ( overChild != NULL ) {
+		overChild->MouseExit();
+		gui->GetPendingCmd() += overChild->cmd;
+		gui->GetPendingCmd() += " ; ";
+		overChild->cmd.Clear();
+		overChild = NULL;
+	}
+}
+
+
+/*
+================
+idWindow::RouteMouseCoords
+================
+*/
+const char *idWindow::RouteMouseCoords(float xd, float yd) {
+	idStr str;
+	ValidateTrackedWindowPointers();
+
+	if (GetCaptureChild()) {
+		//FIXME: unkludge this whole mechanism
+		return GetCaptureChild()->RouteMouseCoords(xd, yd);
+	}
+	
+	if (xd == -2000 || yd == -2000) {
+		return "";
+	}
+
+	int c = children.Num();
+	while (c > 0) {
+		idWindow *child = children[--c];
+		if (child->visible && !child->noEvents && child->Contains(child->drawRect, gui->CursorX(), gui->CursorY())) {
+
+			dc->SetCursor(child->cursor);
+			child->hover = true;
+
+			if (overChild != child) {
+				if (overChild) {
+					overChild->MouseExit();
+					str = overChild->cmd;
+					if (str.Length()) {
+						gui->GetDesktop()->AddCommand(str);
+						overChild->cmd = "";
+					}
+				}
+				overChild = child;
+				overChild->MouseEnter();
+				str = overChild->cmd;
+				if (str.Length()) {
+					gui->GetDesktop()->AddCommand(str);
+					overChild->cmd = "";
+				}
+			}
+			if (!(child->flags & WIN_HOLDCAPTURE)) {
+				child->RouteMouseCoords(xd, yd);
+			}
+			return "";
+		}
+	}
+	if (overChild) {
+		overChild->MouseExit();
+		str = overChild->cmd;
+		if (str.Length()) {
+			gui->GetDesktop()->AddCommand(str);
+			overChild->cmd = "";
+		}
+		overChild = NULL;
+	}
+	return "";
+}
+
+/*
+================
+idWindow::Activate
+================
+*/
+void idWindow::Activate( bool activate,	idStr &act ) {
+
+	int n = (activate) ? ON_ACTIVATE : ON_DEACTIVATE;
+
+	//  make sure win vars are updated before activation
+	UpdateWinVars ( );
+
+	RunScript(n);
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		children[i]->Activate( activate, act );
+	}
+
+	if ( act.Length() ) {
+		act += " ; ";
+	}
+}
+
+/*
+================
+idWindow::Init
+================
+*/
+void idWindow::Init() {
+	if ( session == NULL || !session->IsLoadingSaveGame() ) {
+		RunScript( ON_INIT );
+	}
+	int c = children.Num();
+	for ( int i = 0; i < c; i++ ) {
+		children[i]->Init();
+	}
+}
+
+/*
+================
+idWindow::Trigger
+================
+*/
+void idWindow::Trigger() {
+	RunScript( ON_TRIGGER );
+	int c = children.Num();
+	for ( int i = 0; i < c; i++ ) {
+		children[i]->Trigger();
+	}
+	StateChanged( true );
+}
+
+/*
+================
+idWindow::StateChanged
+================
+*/
+void idWindow::StateChanged( bool redraw ) {
+
+	UpdateWinVars();
+// jmarshall - gui crash.
+	if (expressionRegisters.Num() && numOps) {
+// jmarshall end
+		EvalRegs();
+	}
+
+	int c = drawWindows.Num();
+	for ( int i = 0; i < c; i++ ) {
+		if ( drawWindows[i].win ) {
+			drawWindows[i].win->StateChanged( redraw );
+		} else {
+			drawWindows[i].simp->StateChanged( redraw );
+		}
+	}
+
+	if ( redraw ) {
+		if ( flags & WIN_DESKTOP ) {
+			Redraw( 0.0f, 0.0f );
+		}
+		if ( background && background->CinematicLength() ) {
+			background->UpdateCinematic( gui->GetTime() );
+		}
+	}
+}
+
+/*
+================
+idWindow::SetCapture
+================
+*/
+idWindow *idWindow::SetCapture(idWindow *w) {
+	// only one child can have the focus
+
+	idWindow *last = NULL;
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		if ( children[i]->flags & WIN_CAPTURE ) {
+			last = children[i];
+			//last->flags &= ~WIN_CAPTURE;
+			last->LoseCapture();
+			break;
+		}
+	}
+
+	if ( w ) {
+		w->flags |= WIN_CAPTURE;
+		w->GainCapture();
+	}
+	gui->GetDesktop()->captureChild = w;
+	return last;
+}
+
+/*
+================
+idWindow::AddUpdateVar
+================
+*/
+void idWindow::AddUpdateVar(idWinVar *var) {
+	updateVars.AddUnique(var);
+}
+
+/*
+================
+idWindow::UpdateWinVars
+================
+*/
+void idWindow::UpdateWinVars() {
+	int c = updateVars.Num();
+	for (int i = 0; i < c; i++) {
+		updateVars[i]->Update();
+	}
+}
+
+/*
+================
+idWindow::RunTimeEvents
+================
+*/
+bool idWindow::RunTimeEvents(int time) {
+	if ( parent && parent->GetGui() && gui != parent->GetGui() ) {
+		gui = parent->GetGui();
+	}
+	if ( gui == NULL ) {
+		return false;
+	}
+
+	// Save/load and other clock resets can move GUI time backwards.
+	// Clamp stale timestamps so timed HUD events can recover instead of
+	// remaining frozen for the rest of the level.
+	const float userCmdMsec = common->GetUserCmdMsecFloat();
+	if ( lastTimeRun > time ) {
+		lastTimeRun = time - static_cast<int>( idMath::Ceil( userCmdMsec ) );
+	}
+	if ( timeLine > time ) {
+		timeLine = time;
+	}
+
+	if ( static_cast<float>( time - lastTimeRun ) < userCmdMsec ) {
+		//common->Printf("Skipping gui time events at %i\n", time);
+		return false;
+	}
+
+	lastTimeRun = time;
+
+	UpdateWinVars();
+// jmarshall - gui crash.
+	if (expressionRegisters.Num() && numOps) {
+// jmarshall end
+		EvalRegs();
+	}
+
+	if ( flags & WIN_INTRANSITION ) {
+		Transition();
+	}
+
+	Time();
+
+	// renamed ON_EVENT to ON_FRAME
+	RunScript(ON_FRAME);
+
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		children[i]->RunTimeEvents(time);
+	}
+
+	return true;
+}
+
+/*
+================
+idWindow::RunNamedEvent
+================
+*/
+void idWindow::RunNamedEvent ( const char* eventName )
+{
+	int i;
+	int c;
+
+	// Find and run the event	
+	c = namedEvents.Num( );
+	for ( i = 0; i < c; i ++ ) {
+		if ( namedEvents[i]->mName.Icmp( eventName ) ) {	
+			continue;
+		}
+
+		UpdateWinVars();
+
+		// Make sure we got all the current values for stuff
+// jmarshall - gui crash
+		if (expressionRegisters.Num() && numOps) {
+// jmarshall end
+			EvalRegs(-1, true);
+		}
+		
+		RunScriptList( namedEvents[i]->mEvent );
+		
+		break;
+	}
+	
+	// Run the event in all the children as well
+	c = children.Num();
+	for ( i = 0; i < c; i++ ) {
+		children[i]->RunNamedEvent ( eventName );
+	}
+}
+
+/*
+================
+idWindow::HasNamedEvent
+================
+*/
+bool idWindow::HasNamedEvent( const char* eventName ) const {
+	for ( int i = 0; i < namedEvents.Num(); i++ ) {
+		if ( !namedEvents[i]->mName.Icmp( eventName ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+================
+idWindow::Contains
+================
+*/
+bool idWindow::Contains(const idRectangle &sr, float x, float y) {
+	idRectangle r = sr;
+	r.x += actualX - drawRect.x;
+	r.y += actualY - drawRect.y;
+	return r.Contains(x, y);
+}
+
+/*
+================
+idWindow::Contains
+================
+*/
+bool idWindow::Contains(float x, float y) {
+	idRectangle r = drawRect;
+	r.x = actualX;
+	r.y = actualY;
+	return r.Contains(x, y);
+}
+
+/*
+================
+idWindow::AddCommand
+================
+*/
+void idWindow::AddCommand(const char *_cmd) {
+	idStr str = cmd;
+	if (str.Length()) {
+		str += " ; ";
+		str += _cmd;
+	} else {
+		str = _cmd;
+	}
+	cmd = str;
+}
+
+/*
+================
+idWindow::HandleEvent
+================
+*/
+const char *idWindow::HandleEvent(const sysEvent_t *event, bool *updateVisuals) {
+	static bool actionDownRun;
+	static bool actionUpRun;
+	sysEvent_t translatedEvent;
+	int controllerFocusDirection = 0;
+
+	if ( parent && parent->GetGui() && gui != parent->GetGui() ) {
+		gui = parent->GetGui();
+	}
+	if ( gui == NULL ) {
+		return "";
+	}
+
+	const bool controllerEvent = TranslateControllerMenuKey( event, translatedEvent, controllerFocusDirection );
+	if ( controllerEvent ) {
+		event = &translatedEvent;
+	}
+
+	cmd = "";
+
+	if ( flags & WIN_DESKTOP ) {
+		actionDownRun = false;
+		actionUpRun = false;
+		if (expressionRegisters.Num() && numOps) {
+			EvalRegs();
+		}
+		RunTimeEvents(gui->GetTime());
+		CalcRects(0,0);
+		dc->SetCursor( idDeviceContext::CURSOR_ARROW );
+
+		if ( controllerEvent && event->evValue2 && !gui->ControllerNavigation() && !GetCaptureChild() ) {
+			ClearMouseHover();
+			gui->SetControllerNavigation( true );
+			if ( focusedChild != NULL ) {
+				focusedChild->MouseEnter();
+			}
+		} else if ( gui->ControllerNavigation() ) {
+			const bool mouseMoved = event->evType == SE_MOUSE && ( event->evValue != 0 || event->evValue2 != 0 );
+			const bool mousePressed = event->evType == SE_KEY && event->evValue2 &&
+				event->evValue >= K_MOUSE1 && event->evValue <= K_MWHEELUP;
+			if ( mouseMoved || mousePressed ) {
+				if ( focusedChild != NULL ) {
+					focusedChild->MouseExit();
+				}
+				ClearMouseHover();
+				gui->SetControllerNavigation( false );
+				RouteMouseCoords( 0, 0 );
+			}
+		}
+	}
+
+	if (visible && !noEvents) {
+
+		if (event->evType == SE_KEY) {
+			EvalRegs(-1, true);
+			if (updateVisuals) {
+				*updateVisuals = true;
+			}
+
+			if (event->evValue == K_MOUSE1) {
+
+				if (!event->evValue2 && GetCaptureChild()) {
+					GetCaptureChild()->LoseCapture();
+					gui->GetDesktop()->captureChild = NULL;
+					return "";
+				} 
+
+				for ( int c = children.Num() - 1; c >= 0; c-- ) {
+					if ( c >= children.Num() ) {
+						continue;
+					}
+					idWindow *child = children[c];
+					if ( child == NULL ) {
+						continue;
+					}
+					if ( child->visible && child->Contains( child->drawRect, gui->CursorX(), gui->CursorY() ) && !( child->noEvents ) ) {
+						if (event->evValue2) {
+							BringToTop(child);
+							SetFocus(child);
+							if (child->flags & WIN_HOLDCAPTURE) {
+								SetCapture(child);
+							}
+						}
+						if (child->Contains(child->clientRect, gui->CursorX(), gui->CursorY())) {
+							//if ((gui_edit.GetBool() && (child->flags & WIN_SELECTED)) || (!gui_edit.GetBool() && (child->flags & WIN_MOVABLE))) {
+							//	SetCapture(child);
+							//}
+							SetFocus(child);
+							const bool childIsModal = ( child->flags & WIN_MODAL ) != 0;
+							const char *childRet = child->HandleEvent(event, updateVisuals);
+							if (childRet && *childRet) {
+								return childRet;
+							} 
+							if ( childIsModal ) {
+								return "";
+							}
+						} else {
+							if (event->evValue2) {
+								SetFocus(child);
+								bool capture = true;
+								if (capture && ((child->flags & WIN_MOVABLE) || gui_edit.GetBool())) {
+									SetCapture(child);
+								}
+								return "";
+							} else {
+							}
+						}
+					}
+				}
+				if (event->evValue2 && !actionDownRun) {
+					actionDownRun = RunScript( ON_ACTION );
+				} else if (!actionUpRun) {
+					actionUpRun = RunScript( ON_ACTIONRELEASE );
+				}
+			} else if (event->evValue == K_MOUSE2) {
+
+				if (!event->evValue2 && GetCaptureChild()) {
+					GetCaptureChild()->LoseCapture();
+					gui->GetDesktop()->captureChild = NULL;
+					return "";
+				}
+
+				for ( int c = children.Num() - 1; c >= 0; c-- ) {
+					if ( c >= children.Num() ) {
+						continue;
+					}
+					idWindow *child = children[c];
+					if ( child == NULL ) {
+						continue;
+					}
+					if ( child->visible && child->Contains( child->drawRect, gui->CursorX(), gui->CursorY() ) && !( child->noEvents ) ) {
+						if (event->evValue2) {
+							BringToTop(child);
+							SetFocus(child);
+						}
+						if (child->Contains(child->clientRect,gui->CursorX(), gui->CursorY()) || GetCaptureChild() == child) {
+							if ((gui_edit.GetBool() && (child->flags & WIN_SELECTED)) || (!gui_edit.GetBool() && (child->flags & WIN_MOVABLE))) {
+								SetCapture(child);
+							}
+							const bool childIsModal = ( child->flags & WIN_MODAL ) != 0;
+							const char *childRet = child->HandleEvent(event, updateVisuals);
+							if (childRet && *childRet) {
+								return childRet;
+							} 
+							if ( childIsModal ) {
+								return "";
+							}
+						}
+					}
+				}
+				// Quake 4 runs a window's onBackAction on a right-click press, as a
+				// left-click press runs onAction. The Game Options crosshair preview
+				// steps back through the custom crosshairs with it.
+				if ( event->evValue2 && !actionDownRun ) {
+					actionDownRun = RunScript( ON_BACKACTION );
+				}
+			} else if (event->evValue == K_MOUSE3) {
+				if (gui_edit.GetBool()) {
+					for ( int i = 0; i < children.Num(); i++ ) {
+						if ( i >= children.Num() ) {
+							break;
+						}
+						idWindow *child = children[i];
+						if ( child == NULL ) {
+							continue;
+						}
+						if ( child->drawRect.Contains(gui->CursorX(), gui->CursorY()) ) {
+							if (event->evValue2) {
+								child->flags ^= WIN_SELECTED;
+								if ( child->flags & WIN_SELECTED ) {
+									flags &= ~WIN_SELECTED;
+									return "childsel";
+								}
+							}
+						}
+					}
+				}
+			} else if (event->evValue == K_TAB && event->evValue2) {
+				idWindow *focusedChild = GetFocusedChild();
+				if (focusedChild && focusedChild != this) {
+					const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+					if (childRet && *childRet) {
+						return childRet;
+					}
+				}
+				int direction = idKeyInput::IsDown( K_SHIFT ) ? -1 : 1;
+				NavigateFocus( this, direction );
+			} else if (event->evValue == K_ESCAPE && event->evValue2) {
+				idWindow *focusedChild = GetFocusedChild();
+				if (focusedChild && focusedChild != this) {
+					const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+					if (childRet && *childRet) {
+						return childRet;
+					}
+				}
+				RunScript( ON_ESC );
+			} else if (event->evValue == K_ENTER || event->evValue == K_KP_ENTER ) {
+				idWindow *focusedChild = GetFocusedChild();
+				if (focusedChild && focusedChild != this) {
+					const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+					if (childRet && *childRet) {
+						return childRet;
+					}
+				}
+				if ( ( flags & WIN_WANTENTER ) || ( scripts[ ON_ACTION ] != NULL && !WindowHasNativeEnterHandling( this ) ) ) {
+					if ( event->evValue2 ) {
+						RunScript( ON_ACTION );
+					} else {
+						RunScript( ON_ACTIONRELEASE );
+					}
+				}
+			} else if (controllerFocusDirection != 0 && event->evValue2) {
+				idWindow *focusedChild = GetFocusedChild();
+				const bool selfConsumesDirection = ( focusedChild == this ) && WindowConsumesDirectionalNavigation( this, event->evValue );
+				const bool childConsumesDirection = WindowConsumesDirectionalNavigation( focusedChild, event->evValue );
+				if (focusedChild && focusedChild != this) {
+					const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+					if (childRet && *childRet) {
+						return childRet;
+					}
+					if ( childConsumesDirection ) {
+						return "";
+					}
+				}
+				if ( !selfConsumesDirection ) {
+					NavigateFocus( this, controllerFocusDirection, true );
+				}
+			} else {
+				idWindow *focusedChild = GetFocusedChild();
+				if (focusedChild && focusedChild != this) {
+					const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+					if (childRet && *childRet) {
+						return childRet;
+					}
+				}
+			}
+
+		} else if (event->evType == SE_MOUSE && !gui->ControllerNavigation()) {
+			if (updateVisuals) {
+				*updateVisuals = true;
+			}
+			const char *mouseRet = RouteMouseCoords(event->evValue, event->evValue2);
+			if (mouseRet && *mouseRet) {
+				return mouseRet;
+			}
+		} else if (event->evType == SE_NONE) {
+		} else if (event->evType == SE_CHAR) {
+			idWindow *focusedChild = GetFocusedChild();
+			if (focusedChild && focusedChild != this) {
+				const char *childRet = focusedChild->HandleEvent(event, updateVisuals);
+				if (childRet && *childRet) {
+					return childRet;
+				}
+			}
+		}
+	}
+
+	if ( parent && parent->GetGui() && gui != parent->GetGui() ) {
+		gui = parent->GetGui();
+	}
+	if ( gui == NULL ) {
+		cmd = "";
+		return "";
+	}
+
+	gui->GetReturnCmd() = cmd;
+	if ( gui->GetPendingCmd().Length() ) {
+		gui->GetReturnCmd() += " ; ";
+		gui->GetReturnCmd() += gui->GetPendingCmd();
+		gui->GetPendingCmd().Clear();
+	}
+	cmd = "";
+	return gui->GetReturnCmd();
+}
+
+/*
+================
+idWindow::DebugDraw
+================
+*/
+void idWindow::DebugDraw(int time, float x, float y) {
+	if (dc) {
+		dc->EnableClipping(false);
+		if (gui_debug.GetInteger() == 1) {
+			dc->DrawRect(drawRect.x, drawRect.y, drawRect.w, drawRect.h, 1, idDeviceContext::colorRed);
+		} else if (gui_debug.GetInteger() == 2) {
+			idStr buff;
+			idStr str;
+			str = text.c_str();
+			
+			if (str.Length()) {
+				buff = str;
+				buff += "\n";
+			}
+
+			buff += va("Rect: %0.1f, %0.1f, %0.1f, %0.1f\n", rect.x(), rect.y(), rect.w(), rect.h());
+			buff += va("Draw Rect: %0.1f, %0.1f, %0.1f, %0.1f\n", drawRect.x, drawRect.y, drawRect.w, drawRect.h);
+			buff += va("Client Rect: %0.1f, %0.1f, %0.1f, %0.1f\n", clientRect.x, clientRect.y, clientRect.w, clientRect.h);
+			buff += va("Cursor: %0.1f : %0.1f\n", gui->CursorX(), gui->CursorY());
+
+
+			//idRectangle tempRect = textRect;
+			//tempRect.x += offsetX;
+			//drawRect.y += offsetY;
+			dc->DrawText(buff.c_str(), textScale, textAlign, foreColor, textRect, true);
+		} 
+		dc->EnableClipping(true);
+	}
+}
+
+/*
+================
+idWindow::Transition
+================
+*/
+void idWindow::Transition() {
+	int i, c = transitions.Num();
+	bool clear = true;
+
+	for ( i = 0; i < c; i++ ) {
+		idTransitionData *data = &transitions[i];
+		idWinRectangle *r = NULL;
+		idWinVec4 *v4 = dynamic_cast<idWinVec4*>(data->data);
+		idWinFloat* val = NULL;
+		idWinFloatPtr* valp = NULL;
+		if (v4 == NULL) {
+			r = dynamic_cast<idWinRectangle*>(data->data);
+			if ( !r ) {
+				val = dynamic_cast<idWinFloat*>(data->data);
+				if (!val)
+				{
+					valp = dynamic_cast<idWinFloatPtr*>(data->data);
+				}
+			}
+		}
+		if ( data->interp.IsDone( gui->GetTime() ) && data->data) {
+			if (v4) {
+				*v4 = data->interp.GetEndValue();
+			} else if ( val ) {
+				*val = data->interp.GetEndValue()[0];
+			}
+			else if (valp) {
+				*valp = data->interp.GetEndValue()[0];
+			} else {
+				*r = data->interp.GetEndValue();
+			}
+		} else {
+			clear = false;
+			if (data->data) {
+				if (v4) {
+					*v4 = data->interp.GetCurrentValue( gui->GetTime() );
+				} else if ( val ) {
+					*val = data->interp.GetCurrentValue( gui->GetTime() )[0];
+				}
+				else if (valp) {
+					*valp = data->interp.GetCurrentValue(gui->GetTime())[0];
+				} else {
+					*r = data->interp.GetCurrentValue( gui->GetTime() );
+				}
+			} else {
+				common->Warning("Invalid transitional data for window %s in gui %s", GetName(), gui->GetSourceFile());
+			}
+		}
+	}
+
+	if ( clear ) {
+		transitions.SetNum( 0, false );
+		flags &= ~WIN_INTRANSITION;
+	}
+}
+
+/*
+================
+idWindow::Time
+================
+*/
+void idWindow::Time() {
+	if ( parent && parent->GetGui() && gui != parent->GetGui() ) {
+		gui = parent->GetGui();
+	}
+	if ( gui == NULL ) {
+		return;
+	}
+	
+	if ( noTime ) {
+		return;
+	}
+
+	if ( timeLine > gui->GetTime() ) {
+		timeLine = gui->GetTime();
+	}
+
+	if ( timeLine == -1 ) {
+		timeLine = gui->GetTime();
+	}
+
+	cmd = "";
+
+	int c = timeLineEvents.Num();
+	if ( c > 0 ) {
+		for (int i = 0; i < c; i++) {
+			if ( timeLineEvents[i]->pending && gui->GetTime() - timeLine >= timeLineEvents[i]->time ) {
+				timeLineEvents[i]->pending = false;
+				if ( gui_debugScript.GetInteger() > 1 ) {
+					common->Printf("GUI: onTime window=%s time=%d gui=%s\n",
+						GetName(), timeLineEvents[i]->time, gui->GetSourceFile());
+				}
+				RunScriptList( timeLineEvents[i]->event );
+			}
+		}
+	}
+	if ( gui->Active() ) {
+		if ( cmd.Length() ) {
+			idStr& pendingCmd = gui->GetPendingCmd();
+			if ( pendingCmd.Length() ) {
+				pendingCmd += " ; ";
+			}
+			pendingCmd += cmd;
+		}
+	}
+}
+
+/*
+================
+idWindow::EvalRegs
+================
+*/
+float idWindow::EvalRegs(int test, bool force) {
+	static float regs[MAX_EXPRESSION_REGISTERS];
+	static idWindow *lastEval = NULL;
+	UI_LegacyObservationCache(this,&lastEval);
+
+	if (!force && test >= 0 && test < MAX_EXPRESSION_REGISTERS && lastEval == this) {
+		return regs[test];
+	}
+
+	lastEval = this;
+
+	if (expressionRegisters.Num()) {
+		regList.SetToRegs(regs);
+		EvaluateRegisters(regs);
+		regList.GetFromRegs(regs);
+		if (UI_LegacyObservationActive(this)) UI_LegacyObservationEvaluation(this,regs,expressionRegisters.Num(),&matColor,matColor.w());
+	}
+
+	if (test >= 0 && test < MAX_EXPRESSION_REGISTERS) {
+		return regs[test];
+	}
+
+	return 0.0;
+}
+
+/*
+================
+idWindow::DrawBackground
+================
+*/
+void idWindow::DrawBackground(const idRectangle &drawRect) {
+	if ( backColor.w() ) {
+		dc->DrawFilledRect(drawRect.x, drawRect.y, drawRect.w, drawRect.h, backColor);
+	}
+
+	if ( background && matColor.w() ) {
+		if ( DrawPlaybackGraph( dc, gui, GetName(), background, drawRect, matColor ) ) {
+			return;
+		}
+		if ( ShouldDrawCinematicUnderlay( background, drawRect ) ) {
+			DrawCinematicUnderlay( dc );
+		} else if ( ShouldDrawSplashUnderlay( background, drawRect ) ) {
+			DrawSplashUnderlay( dc );
+		}
+		if ( ShouldDrawNativeScreenOverlay( gui, GetName(), background, drawRect, flags ) ) {
+			DrawNativeScreenOverlay( background, matColor );
+			return;
+		}
+
+		if ( flags & WIN_MATCANVASFILL ) {
+			const float imageWidth = background->GetImageWidth();
+			const float imageHeight = background->GetImageHeight();
+			if ( imageWidth > 0.0f && imageHeight > 0.0f && drawRect.w > 0.0f && drawRect.h > 0.0f ) {
+				float s0 = 0.0f;
+				float s1 = 1.0f;
+				float t0 = 0.0f;
+				float t1 = 1.0f;
+
+				const float imageAspect = imageWidth / imageHeight;
+				const float canvasAspect = ( dc != NULL ) ? dc->GetCanvasAspect() : ( drawRect.w / drawRect.h );
+				if ( imageAspect > canvasAspect ) {
+					// Uniform fill on canvas: crop equally from left/right.
+					const float keptWidth = canvasAspect / imageAspect;
+					s0 = ( 1.0f - keptWidth ) * 0.5f;
+					s1 = s0 + keptWidth;
+				} else if ( imageAspect < canvasAspect ) {
+					// Uniform fill on canvas: crop equally from top/bottom.
+					const float keptHeight = imageAspect / canvasAspect;
+					t0 = ( 1.0f - keptHeight ) * 0.5f;
+					t1 = t0 + keptHeight;
+				}
+
+				float drawX = drawRect.x;
+				float drawY = drawRect.y;
+				float drawW = drawRect.w;
+				float drawH = drawRect.h;
+				if ( dc->ClippedCoords( &drawX, &drawY, &drawW, &drawH, &s0, &t0, &s1, &t1 ) ) {
+					return;
+				}
+				dc->AdjustCoords( &drawX, &drawY, &drawW, &drawH );
+
+				renderSystem->SetColor( matColor );
+				dc->DrawStretchPic( drawX, drawY, drawW, drawH, s0, t0, s1, t1, background );
+				return;
+			}
+		}
+
+		float axisScaleX = 1.0f;
+		float axisScaleY = 1.0f;
+		if ( dc != NULL ) {
+			dc->AdjustCoords( NULL, NULL, &axisScaleX, &axisScaleY );
+		}
+		if ( axisScaleX <= 0.0f ) {
+			axisScaleX = 1.0f;
+		}
+		if ( axisScaleY <= 0.0f ) {
+			axisScaleY = 1.0f;
+		}
+
+		if ( flags & WIN_MATCOVER ) {
+			const float imageWidth = background->GetImageWidth();
+			const float imageHeight = background->GetImageHeight();
+			if ( imageWidth > 0.0f && imageHeight > 0.0f && drawRect.w > 0.0f && drawRect.h > 0.0f ) {
+				float s0 = 0.0f;
+				float s1 = 1.0f;
+				float t0 = 0.0f;
+				float t1 = 1.0f;
+
+				const float imageAspect = imageWidth / imageHeight;
+				const float rectAspect = ( drawRect.w * axisScaleX ) / ( drawRect.h * axisScaleY );
+				if ( imageAspect > rectAspect ) {
+					// Image is wider than the destination: crop equally from left/right.
+					const float keptWidth = rectAspect / imageAspect;
+					s0 = ( 1.0f - keptWidth ) * 0.5f;
+					s1 = s0 + keptWidth;
+				} else if ( imageAspect < rectAspect ) {
+					// Image is taller than the destination: crop equally from top/bottom.
+					const float keptHeight = imageAspect / rectAspect;
+					t0 = ( 1.0f - keptHeight ) * 0.5f;
+					t1 = t0 + keptHeight;
+				}
+
+				float drawX = drawRect.x;
+				float drawY = drawRect.y;
+				float drawW = drawRect.w;
+				float drawH = drawRect.h;
+				if ( dc->ClippedCoords( &drawX, &drawY, &drawW, &drawH, &s0, &t0, &s1, &t1 ) ) {
+					return;
+				}
+				dc->AdjustCoords( &drawX, &drawY, &drawW, &drawH );
+
+				renderSystem->SetColor( matColor );
+				dc->DrawStretchPic( drawX, drawY, drawW, drawH, s0, t0, s1, t1, background );
+				return;
+			}
+		}
+		if ( flags & WIN_MATFIT ) {
+			const float imageWidth = background->GetImageWidth();
+			const float imageHeight = background->GetImageHeight();
+			if ( imageWidth > 0.0f && imageHeight > 0.0f && drawRect.w > 0.0f && drawRect.h > 0.0f ) {
+				float fitX = drawRect.x;
+				float fitY = drawRect.y;
+				float fitW = drawRect.w;
+				float fitH = drawRect.h;
+
+				const float imageAspect = imageWidth / imageHeight;
+				const float rectAspect = ( drawRect.w * axisScaleX ) / ( drawRect.h * axisScaleY );
+				if ( imageAspect > rectAspect ) {
+					// Fit to width; center vertically.
+					fitH = ( drawRect.w * axisScaleX ) / ( imageAspect * axisScaleY );
+					fitY = drawRect.y + ( ( drawRect.h - fitH ) * 0.5f );
+				} else if ( imageAspect < rectAspect ) {
+					// Fit to height; center horizontally.
+					fitW = ( drawRect.h * axisScaleY * imageAspect ) / axisScaleX;
+					fitX = drawRect.x + ( ( drawRect.w - fitW ) * 0.5f );
+				}
+
+				float drawX = fitX;
+				float drawY = fitY;
+				float drawW = fitW;
+				float drawH = fitH;
+				float s0 = 0.0f;
+				float t0 = 0.0f;
+				float s1 = 1.0f;
+				float t1 = 1.0f;
+				if ( dc->ClippedCoords( &drawX, &drawY, &drawW, &drawH, &s0, &t0, &s1, &t1 ) ) {
+					return;
+				}
+				dc->AdjustCoords( &drawX, &drawY, &drawW, &drawH );
+
+				renderSystem->SetColor( matColor );
+				dc->DrawStretchPic( drawX, drawY, drawW, drawH, s0, t0, s1, t1, background );
+				return;
+			}
+		}
+
+		float scalex, scaley;
+		if ( flags & WIN_NATURALMAT ) {
+			scalex = drawRect.w / background->GetImageWidth();
+			scaley = drawRect.h / background->GetImageHeight();
+		} else {
+			scalex = matScalex;
+			scaley = matScaley;
+		}
+		dc->DrawMaterial(drawRect.x, drawRect.y, drawRect.w, drawRect.h, background, matColor, scalex, scaley);
+	}
+}
+
+/*
+================
+idWindow::DrawBorderAndCaption
+================
+*/
+void idWindow::DrawBorderAndCaption(const idRectangle &drawRect) {
+	if ( flags & WIN_BORDER && borderSize && borderColor.w() ) {
+		dc->DrawRect(drawRect.x, drawRect.y, drawRect.w, drawRect.h, borderSize, borderColor);
+	}
+}
+
+/*
+================
+idWindow::SetupTransforms
+================
+*/
+void idWindow::SetupTransforms(float x, float y) {
+	static idMat3 trans;
+	static idVec3 org;
+	
+	trans.Identity();
+	org.Set( origin.x + x, origin.y + y, 0 );
+
+	if ( rotate ) {
+		static idRotation rot;
+		static idVec3 vec(0, 0, 1);
+		rot.Set( org, vec, rotate );
+		trans = rot.ToMat3();
+	}
+
+	if ( shear.x || shear.y ) {
+		static idMat3 smat;
+		smat.Identity();
+		smat[0][1] = shear.x;
+		smat[1][0] = shear.y;
+		trans *= smat;
+	}
+
+	if ( !trans.IsIdentity() ) {
+		dc->SetTransformInfo( org, trans );
+	}
+}
+
+/*
+================
+idWindow::CalcRects
+================
+*/
+void idWindow::CalcRects(float x, float y) {
+	CalcClientRect(0, 0);
+	drawRect.Offset(x, y);
+	clientRect.Offset(x, y);
+	actualX = drawRect.x;
+	actualY = drawRect.y;
+	int c = drawWindows.Num();
+	for (int i = 0; i < c; i++) {
+		if (drawWindows[i].win) {
+			drawWindows[i].win->CalcRects(clientRect.x + xOffset, clientRect.y + yOffset);
+		}
+	}
+	drawRect.Offset(-x, -y);
+	clientRect.Offset(-x, -y);
+}
+
+/*
+================
+idWindow::Redraw
+================
+*/
+void idWindow::Redraw(float x, float y) {
+	idStr str;
+
+	if ( parent && parent->GetGui() && gui != parent->GetGui() ) {
+		gui = parent->GetGui();
+	}
+	if ( parent && parent->GetDC() && dc != parent->GetDC() ) {
+		dc = parent->GetDC();
+	}
+	if ( gui == NULL ) {
+		return;
+	}
+
+	if (r_skipGuiShaders.GetInteger() == 1 || dc == NULL ) {
+		return;
+	}
+	
+	int time = gui->GetTime();
+
+	if ( flags & WIN_DESKTOP && r_skipGuiShaders.GetInteger() != 3 ) {
+		RunTimeEvents( time );
+	}
+
+	if ( r_skipGuiShaders.GetInteger() == 2 ) {
+		return;
+	}
+
+	if ( flags & WIN_SHOWTIME ) {
+		dc->DrawText(va(" %0.1f seconds\n%s", (float)(time - timeLine) / 1000, gui->State().GetString("name")), 0.35f, 0, dc->colorWhite, idRectangle(100, 0, 80, 80), false);
+	}
+
+	if ( flags & WIN_SHOWCOORDS ) {
+		dc->EnableClipping(false);
+		str = va( "x: %i y: %i  cursorx: %i cursory: %i", (int)rect.x(), (int)rect.y(), (int)gui->CursorX(), (int)gui->CursorY() );
+		dc->DrawText(str, 0.25f, 0, dc->colorWhite, idRectangle(0, 0, 100, 20), false);
+		dc->EnableClipping(true);
+	}
+
+	if (!visible) {
+		return;
+	}
+
+	CalcClientRect(0, 0);
+
+	SetFont();
+	//if (flags & WIN_DESKTOP) {
+		// see if this window forces a new aspect ratio
+		dc->SetSize(forceAspectWidth, forceAspectHeight);
+	//}
+
+	//FIXME: go to screen coord tracking
+	drawRect.Offset(x, y);
+	clientRect.Offset(x, y);
+	textRect.Offset(x, y);
+	actualX = drawRect.x;
+	actualY = drawRect.y;
+
+	idVec3	oldOrg;
+	idMat3	oldTrans;
+		
+	dc->GetTransformInfo( oldOrg, oldTrans );
+
+	SetupTransforms(x, y);
+	DrawBackground(drawRect);
+	DrawBorderAndCaption(drawRect);
+
+	const bool pushWindowClip = !( flags & WIN_NOCLIP ) && !UsesSimpleWindowClipBehavior();
+	if ( pushWindowClip ) {
+		idRectangle clipRect = clientRect;
+		if ( flags & WIN_DESKTOP ) {
+			float xExpand = 0.0f;
+			float yExpand = 0.0f;
+			dc->GetVirtualScreenExpansion( forceAspectWidth, forceAspectHeight, xExpand, yExpand );
+			if ( xExpand > 0.0f ) {
+				clipRect.x -= xExpand;
+				clipRect.w += xExpand * 2.0f;
+			}
+			if ( yExpand > 0.0f ) {
+				clipRect.y -= yExpand;
+				clipRect.h += yExpand * 2.0f;
+			}
+		}
+		dc->PushClipRect( clipRect );
+	} 
+
+	if ( r_skipGuiShaders.GetInteger() < 5 ) {
+		Draw(time, x, y);
+	}
+
+	if ( gui_debug.GetInteger() ) {
+		DebugDraw(time, x, y);
+	}
+
+	int c = drawWindows.Num();
+	for ( int i = 0; i < c; i++ ) {
+		if ( drawWindows[i].win ) {
+			drawWindows[i].win->Redraw( clientRect.x + xOffset, clientRect.y + yOffset );
+		} else {
+			drawWindows[i].simp->Redraw( clientRect.x + xOffset, clientRect.y + yOffset );
+		}
+	}
+
+	// Put transforms back to what they were before the children were processed
+	dc->SetTransformInfo(oldOrg, oldTrans);
+
+	if ( pushWindowClip ) {
+		dc->PopClipRect();
+	} 
+
+	if (gui_edit.GetBool()  || (flags & WIN_DESKTOP && !( flags & WIN_NOCURSOR )  && !hideCursor && (gui->Active() || ( flags & WIN_MENUGUI ) ))) {
+		dc->SetTransformInfo(vec3_origin, mat3_identity);
+		gui->DrawCursor();
+	}
+
+	if (gui_debug.GetInteger() && flags & WIN_DESKTOP) {
+		dc->EnableClipping(false);
+		str = va( "x: %1.f y: %1.f",  gui->CursorX(), gui->CursorY() );
+		dc->DrawText(str, 0.25, 0, dc->colorWhite, idRectangle(0, 0, 100, 20), false);
+		dc->DrawText(gui->GetSourceFile(), 0.25, 0, dc->colorWhite, idRectangle(0, 20, 300, 20), false);
+		dc->EnableClipping(true);
+	}
+
+	drawRect.Offset(-x, -y);
+	clientRect.Offset(-x, -y);
+	textRect.Offset(-x, -y);
+}
+
+/*
+================
+idWindow::SetDC
+================
+*/
+void idWindow::SetDC(idDeviceContext *d) {
+	dc = d;
+	//if (flags & WIN_DESKTOP) {
+		dc->SetSize(forceAspectWidth, forceAspectHeight);
+	//}
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		children[i]->SetDC(d);
+	}
+}
+
+/*
+================
+idWindow::ArchiveToDictionary
+================
+*/
+void idWindow::ArchiveToDictionary(idDict *dict, bool useNames) {
+	//FIXME: rewrite without state
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		children[i]->ArchiveToDictionary(dict);
+	}
+}
+
+/*
+================
+idWindow::InitFromDictionary
+================
+*/
+void idWindow::InitFromDictionary(idDict *dict, bool byName) {
+	//FIXME: rewrite without state
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		children[i]->InitFromDictionary(dict);
+	}
+}
+
+/*
+================
+idWindow::CalcClientRect
+================
+*/
+void idWindow::CalcClientRect(float xofs, float yofs) {
+	drawRect = rect;
+
+	if ( flags & WIN_INVERTRECT ) {
+		drawRect.x = rect.x() - rect.w();
+		drawRect.y = rect.y() - rect.h();
+	}
+	
+	if (flags & (WIN_HCENTER | WIN_VCENTER) && parent) {
+		// in this case treat xofs and yofs as absolute top left coords
+		// and ignore the original positioning
+		if (flags & WIN_HCENTER) {
+			drawRect.x = (parent->rect.w() - rect.w()) / 2;
+		}
+		if (flags & WIN_VCENTER) {
+			drawRect.y = (parent->rect.h() - rect.h()) / 2;
+		}
+	}
+
+	drawRect.x += xofs;
+	drawRect.y += yofs;
+
+	const bool applyScreenAlignX = ( parent == NULL ) || ( ( parent->GetFlags() & WIN_DESKTOP ) != 0 ) || ( parent->GetScreenAlignX() == SCREEN_ALIGN_X_MIDDLE );
+	const bool applyScreenAlignY = ( parent == NULL ) || ( ( parent->GetFlags() & WIN_DESKTOP ) != 0 ) || ( parent->GetScreenAlignY() == SCREEN_ALIGN_Y_MIDDLE );
+	if ( dc != NULL && ( applyScreenAlignX || applyScreenAlignY ) &&
+			!( gui != NULL && idRetainedHud::UsesClassicCanvas( gui->GetSourceFile() ) ) ) {
+		float xExpand = 0.0f;
+		float yExpand = 0.0f;
+		dc->GetVirtualScreenExpansion( forceAspectWidth, forceAspectHeight, xExpand, yExpand );
+
+		if ( xExpand > 0.0f && applyScreenAlignX ) {
+			if ( screenAlignX == SCREEN_ALIGN_X_LEFT ) {
+				drawRect.x -= xExpand;
+			} else if ( screenAlignX == SCREEN_ALIGN_X_RIGHT ) {
+				drawRect.x += xExpand;
+			}
+		}
+
+		if ( yExpand > 0.0f && applyScreenAlignY ) {
+			if ( screenAlignY == SCREEN_ALIGN_Y_TOP ) {
+				drawRect.y -= yExpand;
+			} else if ( screenAlignY == SCREEN_ALIGN_Y_BOTTOM ) {
+				drawRect.y += yExpand;
+			}
+		}
+
+		AdjustTournamentWarmupLayout( gui, GetName(), parent != NULL ? parent->GetName() : NULL, xofs, xExpand, drawRect );
+		OpenQ4_ExpandLegacyMessageBackdrop( gui != NULL ? gui->GetSourceFile() : NULL,
+			GetName(), xExpand, yExpand, drawRect );
+	}
+
+	clientRect = drawRect;
+	if (rect.h() > 0.0 && rect.w() > 0.0) {
+
+		if (flags & WIN_BORDER && borderSize != 0.0) {
+			clientRect.x += borderSize;
+			clientRect.y += borderSize;
+			clientRect.w -= borderSize;
+			clientRect.h -= borderSize;
+		}
+
+		textRect = clientRect;
+		textRect.x += 2.0;
+	 	textRect.w -= 2.0;
+		textRect.y += 2.0;
+		textRect.h -= 2.0;
+
+		textRect.x += textAlignx;
+		textRect.y += textAligny;
+
+	}
+	origin.Set( rect.x() + (rect.w() / 2 ), rect.y() + ( rect.h() / 2 ) );
+
+}
+
+/*
+================
+idWindow::SetupBackground
+================
+*/
+void idWindow::SetupBackground() {
+	background = NULL;
+	if (backGroundName.Length()) {
+		background = declManager->FindMaterial(backGroundName);
+		if ( background ) {
+			background->SetImageClassifications( 1 );	// just for resource tracking
+		}
+		// Retail stamps GUI backgrounds to SS_GUI unless they are defaulted or
+		// explicitly post-process sorted. This preserves GUI file emission order
+		// for authored materials as well as implicit image materials.
+		if ( background && !background->TestMaterialFlag( MF_DEFAULTED )
+				&& background->GetSort() < SS_POST_PROCESS ) {
+			background->SetSort(SS_GUI );
+		}
+	}
+	backGroundName.SetMaterialPtr(&background);
+}
+
+bool idWindow::CanKeepForLevelLoad() const {
+    // Custom game/editor widgets can own state outside the ordinary window
+    // tree. Keep their existing full reload until they have a refresh path.
+    const auto& type = typeid(*this);
+    if (type != typeid(idWindow) && type != typeid(idBindWindow) && type != typeid(idChoiceWindow) &&
+        type != typeid(idEditWindow) && type != typeid(idFieldWindow) && type != typeid(idListWindow) &&
+        type != typeid(idSliderWindow) && type != typeid(idRenderWindow)) return false;
+    for (int i = 0; i < children.Num(); ++i)
+        if (!children[i]->CanKeepForLevelLoad()) return false;
+    return true;
+}
+
+void idWindow::CaptureForLevelLoad() {
+    // The save stream stores authored background names; scrollers also have
+    // constructor-assigned backgrounds with no name variable to serialize.
+    levelLoadDirectBackground = background && !backGroundName.c_str()[0] ? background : NULL;
+    for (int i = 0; i < children.Num(); ++i) children[i]->CaptureForLevelLoad();
+}
+
+void idWindow::RefreshForLevelLoad() {
+    if (!background && levelLoadDirectBackground) background = levelLoadDirectBackground;
+    // Scrollers install a background directly, without backGroundName. Use
+    // the live material identity so their defaults survive too.
+    if (background) {
+        const idStr materialName = background->GetName();
+        background = declManager->FindMaterial(materialName);
+        background->SetImageClassifications(1);
+        if (!background->TestMaterialFlag(MF_DEFAULTED) && background->GetSort() < SS_POST_PROCESS)
+            background->SetSort(SS_GUI);
+    }
+    for (int i = 0; i < numOps; ++i) {
+        if (ops[i].opType == WOP_TYPE_TABLE) {
+            const idDecl* table = declManager->DeclByIndex(DECL_TABLE, ops[i].a, false);
+            declManager->FindType(DECL_TABLE, table->GetName());
+        }
+    }
+    for (int i = 0; i < drawWindows.Num(); ++i) {
+        if (drawWindows[i].simp) {
+            idSimpleWindow* simple = drawWindows[i].simp;
+            if (simple->background) {
+                simple->background = declManager->FindMaterial(simple->background->GetName());
+                simple->background->SetSort(SS_GUI);
+            }
+        }
+    }
+    for (int i = 0; i < children.Num(); ++i) children[i]->RefreshForLevelLoad();
+}
+
+/*
+================
+idWindow::SetupFromState
+================
+*/
+void idWindow::SetupFromState() {
+	idStr str;
+	background = NULL;
+
+	SetupBackground();
+
+	if (borderSize) {
+		flags |= WIN_BORDER;
+	}
+
+	if (regList.FindReg("rotate") || regList.FindReg("shear")) {
+		flags |= WIN_TRANSFORM;
+	}
+	
+	CalcClientRect(0,0);
+	if ( scripts[ ON_ACTION ] ) {
+		cursor = idDeviceContext::CURSOR_HAND;
+		flags |= WIN_CANFOCUS;
+	}
+}
+
+/*
+================
+idWindow::Moved
+================
+*/
+void idWindow::Moved() {
+}
+
+/*
+================
+idWindow::Sized
+================
+*/
+void idWindow::Sized() {
+}
+
+/*
+================
+idWindow::GainFocus
+================
+*/
+void idWindow::GainFocus() {
+}
+
+/*
+================
+idWindow::LoseFocus
+================
+*/
+void idWindow::LoseFocus() {
+}
+
+/*
+================
+idWindow::GainCapture
+================
+*/
+void idWindow::GainCapture() {
+}
+
+/*
+================
+idWindow::LoseCapture
+================
+*/
+void idWindow::LoseCapture() {
+	flags &= ~WIN_CAPTURE;
+}
+
+/*
+================
+idWindow::SetFlag
+================
+*/
+void idWindow::SetFlag(unsigned int f) {
+	flags |= f;
+}
+
+/*
+================
+idWindow::ClearFlag
+================
+*/
+void idWindow::ClearFlag(unsigned int f) {
+	flags &= ~f;
+}
+
+
+/*
+================
+idWindow::SetParent
+================
+*/
+void idWindow::SetParent(idWindow *w) {
+	parent = w;
+	if ( w ) {
+		// Child windows must share the same GUI and device context as their parent.
+		gui = w->gui;
+		if ( dc == NULL ) {
+			dc = w->dc;
+		}
+	}
+}
+
+/*
+================
+idWindow::GetCaptureChild
+================
+*/
+idWindow *idWindow::GetCaptureChild() {
+	if (flags & WIN_DESKTOP) {
+		ValidateTrackedWindowPointers();
+		return captureChild;
+	}
+	if ( gui && gui->GetDesktop() ) {
+		gui->GetDesktop()->ValidateTrackedWindowPointers();
+		return gui->GetDesktop()->captureChild;
+	}
+	return NULL;
+}
+
+/*
+================
+idWindow::GetFocusedChild
+================
+*/
+idWindow *idWindow::GetFocusedChild() {
+	if (flags & WIN_DESKTOP) {
+		ValidateTrackedWindowPointers();
+		return focusedChild;
+	}
+	if ( gui && gui->GetDesktop() ) {
+		gui->GetDesktop()->ValidateTrackedWindowPointers();
+		return gui->GetDesktop()->focusedChild;
+	}
+	return NULL;
+}
+
+
+/*
+================
+idWindow::SetFocus
+================
+*/
+idWindow *idWindow::SetFocus(idWindow *w, bool scripts) {
+	// only one child can have the focus
+	if ( gui == NULL || gui->GetDesktop() == NULL || w == NULL ) {
+		return NULL;
+	}
+
+	idWindow *desktop = gui->GetDesktop();
+	desktop->ValidateTrackedWindowPointers();
+
+	idWindow *lastFocus = NULL;
+	if (w->flags & WIN_CANFOCUS) {
+		lastFocus = desktop->focusedChild;
+		if ( lastFocus ) {
+			lastFocus->flags &= ~WIN_FOCUS;
+			lastFocus->LoseFocus();
+		}
+
+		//  call on lose focus
+		if ( scripts && lastFocus ) {
+			// calling this broke all sorts of guis
+			// lastFocus->RunScript(ON_MOUSEEXIT);
+		}
+		//  call on gain focus
+		if ( scripts && w ) {
+			// calling this broke all sorts of guis
+			// w->RunScript(ON_MOUSEENTER);
+		}
+
+		w->flags |= WIN_FOCUS;
+		w->GainFocus();
+		desktop->focusedChild = w;
+	}
+
+	return lastFocus;
+}
+
+bool idWindow::HasDirectChildReference( const idWindow *window ) const {
+	if ( window == NULL ) {
+		return false;
+	}
+
+	for ( int i = 0; i < children.Num(); ++i ) {
+		if ( children[i] == window ) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool idWindow::HasDescendantReference( const idWindow *window ) const {
+	if ( window == NULL ) {
+		return false;
+	}
+	if ( this == window ) {
+		return true;
+	}
+
+	for ( int i = 0; i < children.Num(); ++i ) {
+		idWindow *child = children[i];
+		if ( child != NULL && child->HasDescendantReference( window ) ) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void idWindow::ClearTrackedWindowReference( const idWindow *window ) {
+	if ( window == NULL ) {
+		return;
+	}
+
+	if ( focusedChild == window ) {
+		focusedChild = NULL;
+	}
+	if ( captureChild == window ) {
+		captureChild = NULL;
+	}
+	if ( overChild == window ) {
+		overChild = NULL;
+	}
+
+	for ( int i = 0; i < children.Num(); ++i ) {
+		idWindow *child = children[i];
+		if ( child != NULL && child != window ) {
+			child->ClearTrackedWindowReference( window );
+		}
+	}
+}
+
+void idWindow::ValidateTrackedWindowPointers() {
+	if ( overChild != NULL && !HasDirectChildReference( overChild ) ) {
+		overChild = NULL;
+	}
+
+	if ( ( flags & WIN_DESKTOP ) != 0 ) {
+		if ( focusedChild != NULL && !HasDescendantReference( focusedChild ) ) {
+			focusedChild = NULL;
+		}
+		if ( captureChild != NULL && !HasDescendantReference( captureChild ) ) {
+			captureChild = NULL;
+		}
+	}
+}
+
+/*
+================
+idWindow::ParseScript
+================
+*/
+bool idWindow::ParseScript(idParser *src, idGuiScriptList &list, int *timeParm, bool elseBlock ) {
+
+	bool	ifElseBlock = false;
+
+	idToken token;
+
+	// scripts start with { ( unless parm is true ) and have ; separated command lists.. commands are command,
+	// arg.. basically we want everything between the { } as it will be interpreted at
+	// run time
+	
+	if ( elseBlock ) {
+		src->ReadToken ( &token );
+	
+		if ( !token.Icmp ( "if" ) ) {
+			ifElseBlock = true;
+		}
+		
+		src->UnreadToken ( &token );
+
+		if ( !ifElseBlock && !src->ExpectTokenString( "{" ) ) {
+			return false;
+		}
+	}
+	else if ( !src->ExpectTokenString( "{" ) ) {
+		return false;
+	}
+
+	int nest = 0;
+
+	while (1) {
+		if ( !src->ReadToken(&token) ) {
+			src->Error( "Unexpected end of file" );
+			return false;
+		}
+
+		if ( token == "{" ) {
+			nest++;
+		}
+
+		if ( token == "}" ) {
+			if (nest-- <= 0) {
+				return true;
+			}
+		}
+
+		idGuiScript *gs = new idGuiScript();
+		if (token.Icmp("if") == 0) {
+			gs->conditionReg = ParseExpression(src);
+			gs->ifList = new idGuiScriptList();
+			ParseScript(src, *gs->ifList, NULL);
+			if (src->ReadToken(&token)) {
+				if (token == "else") {
+					gs->elseList = new idGuiScriptList();
+					// pass true to indicate we are parsing an else condition
+					ParseScript(src, *gs->elseList, NULL, true );
+				} else {
+					src->UnreadToken(&token);
+				}
+			}
+
+			list.Append(gs);
+
+			// if we are parsing an else if then return out so 
+			// the initial "if" parser can handle the rest of the tokens
+			if ( ifElseBlock ) {
+				return true;
+			}
+			continue;
+		} else {
+			src->UnreadToken(&token);
+		}
+
+		// empty { } is not allowed
+		if ( token == "{" ) {
+			 src->Error ( "Unexpected {" );
+			 delete gs;
+			 return false;
+		}
+
+		gs->Parse(src);
+		list.Append(gs);
+	}
+
+}
+
+/*
+================
+idWindow::SaveExpressionParseState
+================
+*/
+void idWindow::SaveExpressionParseState() {
+	saveTemps = (bool*)Mem_Alloc(MAX_EXPRESSION_REGISTERS * sizeof(bool));
+	memcpy(saveTemps, registerIsTemporary, MAX_EXPRESSION_REGISTERS * sizeof(bool));
+}
+
+/*
+================
+idWindow::RestoreExpressionParseState
+================
+*/
+void idWindow::RestoreExpressionParseState() {
+	memcpy(registerIsTemporary, saveTemps, MAX_EXPRESSION_REGISTERS * sizeof(bool));
+	Mem_Free(saveTemps);
+}
+
+/*
+================
+idWindow::ParseScriptEntry
+================
+*/
+bool idWindow::ParseScriptEntry(const char *name, idParser *src) {
+	for (int i = 0; i < SCRIPT_COUNT; i++) {
+		if (idStr::Icmp(name, ScriptNames[i]) == 0) {
+			delete scripts[i];
+			scripts[i] = new idGuiScriptList;
+			return ParseScript(src, *scripts[i]);
+		}
+	}
+	return false;
+}
+
+/*
+================
+idWindow::DisableRegister
+================
+*/
+void idWindow::DisableRegister(const char *_name) {
+	idRegister *reg = RegList()->FindReg(_name);
+	if (reg) {
+		reg->Enable(false);
+	}
+}
+
+/*
+================
+idWindow::PostParse
+================
+*/
+void idWindow::PostParse() {
+}
+	
+/*
+================
+idWindow::GetWinVarOffset
+================
+*/
+intptr_t idWindow::GetWinVarOffset( idWinVar *wv, drawWin_t* owner) {
+	intptr_t ret = -1;
+
+	if ( wv == &rect ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->rect;
+	}
+
+	if ( wv == &backColor ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->backColor;
+	}
+	if ( wv == &backColor_r ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->backColor_r;
+	}
+	if ( wv == &backColor_g ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->backColor_g;
+	}
+	if ( wv == &backColor_b ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->backColor_b;
+	}
+	if ( wv == &backColor_w ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->backColor_w;
+	}
+
+	if ( wv == &matColor ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->matColor;
+	}
+	if ( wv == &matColor_r ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->matColor_r;
+	}
+	if ( wv == &matColor_g ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->matColor_g;
+	}
+	if ( wv == &matColor_b ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->matColor_b;
+	}
+	if ( wv == &matColor_w ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->matColor_w;
+	}
+
+	if ( wv == &foreColor ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->foreColor;
+	}
+	if ( wv == &foreColor_r ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->foreColor_r;
+	}
+	if ( wv == &foreColor_g ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->foreColor_g;
+	}
+	if ( wv == &foreColor_b ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->foreColor_b;
+	}
+	if ( wv == &foreColor_w ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->foreColor_w;
+	}
+
+	if ( wv == &hoverColor ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->hoverColor;
+	}
+	if ( wv == &hoverColor_r ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->hoverColor_r;
+	}
+	if ( wv == &hoverColor_g ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->hoverColor_g;
+	}
+	if ( wv == &hoverColor_b ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->hoverColor_b;
+	}
+	if ( wv == &hoverColor_w ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->hoverColor_w;
+	}
+
+	if ( wv == &borderColor ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->borderColor;
+	}
+	if ( wv == &borderColor_r ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->borderColor_r;
+	}
+	if ( wv == &borderColor_g ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->borderColor_g;
+	}
+	if ( wv == &borderColor_b ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->borderColor_b;
+	}
+	if ( wv == &borderColor_w ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->borderColor_w;
+	}
+
+	if ( wv == &textScale ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->textScale;
+	}
+
+	if ( wv == &rotate ) {
+		ret = (intptr_t)&( ( idWindow * ) 0 )->rotate;
+	}
+
+	if ( ret != -1 ) {
+		owner->win = this;
+		return ret;
+	}
+
+	for ( int i = 0; i < drawWindows.Num(); i++ ) {
+		if ( drawWindows[i].win ) {
+			ret = drawWindows[i].win->GetWinVarOffset( wv, owner );
+		} else {
+			ret = drawWindows[i].simp->GetWinVarOffset( wv, owner );
+		}
+		if ( ret != -1 ) {
+			break;
+		}
+	}
+
+	return ret;
+}
+
+/*
+================
+idWindow::GetWinVarByName
+================
+*/
+idWinVar *idWindow::GetWinVarByName(const char *_name, bool fixup, drawWin_t** owner) {
+	idWinVar *retVar = NULL;
+
+	if ( owner ) {
+		*owner = NULL;
+	}
+
+	if (idStr::Icmp(_name, "notime") == 0) {
+		retVar = &noTime;
+	}
+	if (idStr::Icmp(_name, "background") == 0) {
+		retVar = &backGroundName;
+	}
+	if (idStr::Icmp(_name, "visible") == 0) {
+		retVar = &visible;
+	}
+	if (idStr::Icmp(_name, "rect") == 0) {
+		retVar = &rect;
+	}
+	if (idStr::Icmp(_name, "backColor") == 0) {
+		retVar = &backColor;
+	}
+// jmarshall
+	if (idStr::Icmp(_name, "backColor_r") == 0) {
+		retVar = &backColor_r;
+	}
+	if (idStr::Icmp(_name, "backColor_x") == 0) {
+		retVar = &backColor_r;
+	}
+	if (idStr::Icmp(_name, "backColor_g") == 0) {
+		retVar = &backColor_g;
+	}
+	if (idStr::Icmp(_name, "backColor_y") == 0) {
+		retVar = &backColor_g;
+	}
+	if (idStr::Icmp(_name, "backColor_b") == 0) {
+		retVar = &backColor_b;
+	}
+	if (idStr::Icmp(_name, "backColor_z") == 0) {
+		retVar = &backColor_b;
+	}
+	if (idStr::Icmp(_name, "backColor_w") == 0) {
+		retVar = &backColor_w;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "matColor") == 0) {
+		retVar = &matColor;
+	}
+// jmarshall
+	if (idStr::Icmp(_name, "matColor_r") == 0) {
+		retVar = &matColor_r;
+	}
+	if (idStr::Icmp(_name, "matColor_x") == 0) {
+		retVar = &matColor_r;
+	}
+	if (idStr::Icmp(_name, "matColor_g") == 0) {
+		retVar = &matColor_g;
+	}
+	if (idStr::Icmp(_name, "matColor_y") == 0) {
+		retVar = &matColor_g;
+	}
+	if (idStr::Icmp(_name, "matColor_b") == 0) {
+		retVar = &matColor_b;
+	}
+	if (idStr::Icmp(_name, "matColor_z") == 0) {
+		retVar = &matColor_b;
+	}
+	if (idStr::Icmp(_name, "matColor_w") == 0) {
+		retVar = &matColor_w;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "foreColor") == 0) {
+		retVar = &foreColor;
+	}
+// jmarshall
+	if (idStr::Icmp(_name, "foreColor_r") == 0) {
+		retVar = &foreColor_r;
+	}
+	if (idStr::Icmp(_name, "foreColor_x") == 0) {
+		retVar = &foreColor_r;
+	}
+	if (idStr::Icmp(_name, "foreColor_g") == 0) {
+		retVar = &foreColor_g;
+	}
+	if (idStr::Icmp(_name, "foreColor_y") == 0) {
+		retVar = &foreColor_g;
+	}
+	if (idStr::Icmp(_name, "foreColor_b") == 0) {
+		retVar = &foreColor_b;
+	}
+	if (idStr::Icmp(_name, "foreColor_z") == 0) {
+		retVar = &foreColor_b;
+	}
+	if (idStr::Icmp(_name, "foreColor_w") == 0) {
+		retVar = &foreColor_w;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "hoverColor") == 0) {
+		retVar = &hoverColor;
+	}
+// jmarshall
+	if (idStr::Icmp(_name, "hoverColor_r") == 0) {
+		retVar = &hoverColor_r;
+	}
+	if (idStr::Icmp(_name, "hoverColor_x") == 0) {
+		retVar = &hoverColor_r;
+	}
+	if (idStr::Icmp(_name, "hoverColor_g") == 0) {
+		retVar = &hoverColor_g;
+	}
+	if (idStr::Icmp(_name, "hoverColor_y") == 0) {
+		retVar = &hoverColor_g;
+	}
+	if (idStr::Icmp(_name, "hoverColor_b") == 0) {
+		retVar = &hoverColor_b;
+	}
+	if (idStr::Icmp(_name, "hoverColor_z") == 0) {
+		retVar = &hoverColor_b;
+	}
+	if (idStr::Icmp(_name, "hoverColor_w") == 0) {
+		retVar = &hoverColor_w;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "borderColor") == 0) {
+		retVar = &borderColor;
+	}
+// jmarshall
+	if (idStr::Icmp(_name, "borderColor_r") == 0) {
+		retVar = &borderColor_r;
+	}
+	if (idStr::Icmp(_name, "borderColor_x") == 0) {
+		retVar = &borderColor_r;
+	}
+	if (idStr::Icmp(_name, "borderColor_g") == 0) {
+		retVar = &borderColor_g;
+	}
+	if (idStr::Icmp(_name, "borderColor_y") == 0) {
+		retVar = &borderColor_g;
+	}
+	if (idStr::Icmp(_name, "borderColor_b") == 0) {
+		retVar = &borderColor_b;
+	}
+	if (idStr::Icmp(_name, "borderColor_z") == 0) {
+		retVar = &borderColor_b;
+	}
+	if (idStr::Icmp(_name, "borderColor_w") == 0) {
+		retVar = &borderColor_w;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "textScale") == 0) {
+		retVar = &textScale;
+	}
+	if (idStr::Icmp(_name, "rotate") == 0) {
+		retVar = &rotate;
+	}
+	if (idStr::Icmp(_name, "noEvents") == 0) {
+		retVar = &noEvents;
+	}
+	if (idStr::Icmp(_name, "text") == 0) {
+		retVar = &text;
+	}
+	if (idStr::Icmp(_name, "backGroundName") == 0) {
+		retVar = &backGroundName;
+	}
+	if (idStr::Icmp(_name, "hidecursor") == 0) {
+		retVar = &hideCursor;
+	}
+
+// jmarshall
+	if (idStr::Icmp(_name, "textspacing") == 0) {
+		retVar = &textspacing;
+	}
+
+	if (idStr::Icmp(_name, "textstyle") == 0) {
+		retVar = &textstyle;
+	}
+
+	if (idStr::Icmp(_name, "itemheight") == 0) {
+		retVar = &itemheight;
+	}
+	if (idStr::Icmp(_name, "scrollbar") == 0) {
+		retVar = &scrollbar;
+	}
+
+	if (idStr::Icmp(_name, "backgroundHover") == 0) {
+		retVar = &backgroundHover;
+	}
+
+	if (idStr::Icmp(_name, "backgroundFocus") == 0) {
+		retVar = &backgroundFocus;
+	}
+
+	if (idStr::Icmp(_name, "backgroundLine") == 0) {
+		retVar = &backgroundLine;
+	}
+	if (idStr::Icmp(_name, "backgroundGreyed") == 0) {
+		retVar = &backgroundGreyed;
+	}
+
+	if (idStr::Icmp(_name, "tabTextScales") == 0) {
+		retVar = &tabTextScales;
+	}
+
+	if (idStr::Icmp(_name, "cvarMin") == 0) {
+		retVar = &cvarMin;
+	}
+
+	if (idStr::Icmp(_name, "model1") == 0) {
+		retVar = &model1;
+	}
+
+	if (idStr::Icmp(_name, "skin") == 0) {
+		retVar = &skin;
+	}
+// jmarshall end
+
+
+	idStr key = _name;
+	bool guiVar = (key.Find(VAR_GUIPREFIX) >= 0);
+	int c = definedVars.Num();
+	for (int i = 0; i < c; i++) {
+		if (idStr::Icmp(_name, (guiVar) ? va("%s",definedVars[i]->GetName()) : definedVars[i]->GetName()) == 0) {
+			retVar = definedVars[i];
+			break;
+		}
+	}
+
+	if (retVar) {
+		if (fixup && *_name != '$') {
+			DisableRegister(_name);
+		}
+
+		if ( owner && parent ) {
+			*owner = parent->FindChildByName ( name );
+		}
+
+		return retVar;
+	}
+
+	int len = key.Length();
+	if ( len > 5 && guiVar ) {
+		idWinVar *var = new idWinStr;
+		var->Init(_name, this);
+		definedVars.Append(var);
+		return var;
+	} else if (fixup) {
+		int n = key.Find("::");
+		if (n > 0) {
+			idStr winName = key.Left(n);
+			idStr var = key.Right(key.Length() - n - 2);
+			drawWin_t *win = GetGui()->GetDesktop()->FindChildByName(winName);
+			if (win) {
+				if (win->win) {
+					return win->win->GetWinVarByName(var, false, owner);
+				} else {
+					if ( owner ) {
+						*owner = win;
+					}
+					return win->simp->GetWinVarByName(var);
+				}
+			} 
+		}
+	}
+
+	return NULL;
+}
+
+/*
+================
+idWindow::ParseString
+================
+*/
+void idWindow::ParseString(idParser *src, idStr &out) {
+	idToken tok;
+	if (src->ReadToken(&tok)) {
+		out = tok;
+	}
+}
+
+/*
+================
+idWindow::ParseVec4
+================
+*/
+void idWindow::ParseVec4(idParser *src, idVec4 &out) {
+	idToken tok;
+	src->ReadToken(&tok);
+	out.x = atof(tok);
+	src->ExpectTokenString(",");
+	src->ReadToken(&tok);
+	out.y = atof(tok);
+	src->ExpectTokenString(",");
+	src->ReadToken(&tok);
+	out.z = atof(tok);
+	src->ExpectTokenString(",");
+	src->ReadToken(&tok);
+	out.w = atof(tok);
+}
+
+/*
+================
+idWindow::ParseInternalVar
+================
+*/
+bool idWindow::ParseInternalVar(const char *_name, idParser *src) {
+	if (idStr::Icmp(_name, "showtime") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_SHOWTIME;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "showcoords") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_SHOWCOORDS;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "forceaspectwidth") == 0) {
+		forceAspectWidth = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "forceaspectheight") == 0) {
+		forceAspectHeight = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "matscalex") == 0) {
+		matScalex = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "matscaley") == 0) {
+		matScaley = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "bordersize") == 0) {
+		borderSize = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "nowrap") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_NOWRAP;
+		}
+		return true;
+	}
+// jmarshall - quake 4
+	if (idStr::Icmp(_name, "textSpacing") == 0) {
+		textspacing = src->ParseFloat();
+		return true;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "shadow") == 0) {
+		textShadow = src->ParseInt();
+		return true;
+	}
+	if (idStr::Icmp(_name, "textalign") == 0) {
+		textAlign = src->ParseInt();
+		return true;
+	}
+	if (idStr::Icmp(_name, "textalignx") == 0) {
+		textAlignx = src->ParseFloat();
+		return true;
+	}
+	if (idStr::Icmp(_name, "textaligny") == 0) {
+		textAligny = src->ParseFloat();
+		return true;
+	}
+	if ( idStr::Icmp( _name, "screenalignx" ) == 0 || idStr::Icmp( _name, "screenalignh" ) == 0 ) {
+		idToken token;
+		if ( !src->ReadToken( &token ) ) {
+			return false;
+		}
+		if ( !ParseScreenAlignXToken( token, screenAlignX ) ) {
+			src->Warning( "Unknown screenAlignX value '%s' in window '%s' (expected: middle|left|right)", token.c_str(), GetName() );
+		}
+		return true;
+	}
+	if ( idStr::Icmp( _name, "screenaligny" ) == 0 || idStr::Icmp( _name, "screenalignv" ) == 0 ) {
+		idToken token;
+		if ( !src->ReadToken( &token ) ) {
+			return false;
+		}
+		if ( !ParseScreenAlignYToken( token, screenAlignY ) ) {
+			src->Warning( "Unknown screenAlignY value '%s' in window '%s' (expected: middle|top|bottom)", token.c_str(), GetName() );
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "shear") == 0) {
+		shear.x = src->ParseFloat();
+		idToken tok;
+		src->ReadToken( &tok );
+		if ( tok.Icmp( "," ) ) {
+			src->Error( "Expected comma in shear definiation" );
+			return false;
+		}
+		shear.y = src->ParseFloat();
+		return true;
+	}
+// jmarshall - quake 4
+	if (idStr::Icmp(_name, "textStyle") == 0) {
+		textstyle = src->ParseInt();
+		return true;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "wantenter") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_WANTENTER;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "naturalmatscale") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_NATURALMAT;
+		}
+		return true;
+	}
+	if ( idStr::Icmp( _name, "matcover" ) == 0 ) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_MATCOVER;
+		} else {
+			flags &= ~WIN_MATCOVER;
+		}
+		return true;
+	}
+	if ( idStr::Icmp( _name, "matfit" ) == 0 ) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_MATFIT;
+		} else {
+			flags &= ~WIN_MATFIT;
+		}
+		return true;
+	}
+	if ( idStr::Icmp( _name, "matcanvasfill" ) == 0 ) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_MATCANVASFILL;
+		} else {
+			flags &= ~WIN_MATCANVASFILL;
+		}
+		return true;
+	}
+	if ( idStr::Icmp( _name, "nativescreenoverlay" ) == 0 ) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_NATIVESCREENOVERLAY;
+		} else {
+			flags &= ~WIN_NATIVESCREENOVERLAY;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "noclip") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_NOCLIP;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "nocursor") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_NOCURSOR;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "menugui") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_MENUGUI;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "modal") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_MODAL;
+		}
+		return true;
+	}
+// jmarshall - quake 4
+	if (idStr::Icmp(_name, "alwaysThink") == 0) {
+		alwaysThink = src->ParseBool();
+		return true;
+	}
+	if (idStr::Icmp(_name, "chatWindow") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_CHATWINDOW;
+		}
+		return true;
+	}
+// jmarshall end
+	if (idStr::Icmp(_name, "invertrect") == 0) {
+		if ( src->ParseBool() ) {
+			flags |= WIN_INVERTRECT;
+		}
+		return true;
+	}
+	if (idStr::Icmp(_name, "name") == 0) {
+		ParseString(src, name);
+		return true;
+	}
+	if (idStr::Icmp(_name, "play") == 0) {
+		common->Warning( "play encountered during gui parse.. see Robert\n" );
+		idStr playStr;
+		ParseString(src, playStr);
+		return true;
+	}
+	if (idStr::Icmp(_name, "comment") == 0) {
+		ParseString(src, comment);
+		return true;
+	}
+	if ( idStr::Icmp( _name, "font" ) == 0 ) {
+		idStr fontStr;
+		ParseString( src, fontStr );
+		fontNum = dc->FindFont( fontStr );
+		return true;
+	}
+	return false;
+}
+
+/*
+================
+idWindow::ParseRegEntry
+================
+*/
+bool idWindow::ParseRegEntry(const char *name, idParser *src) {
+	idStr work;
+	work = name;
+	work.ToLower();
+
+	idWinVar *var = GetWinVarByName(work, NULL);
+	if ( var ) {
+		for (int i = 0; i < NumRegisterVars; i++) {
+			if (idStr::Icmp(work, RegisterVars[i].name) == 0) {
+				regList.AddReg(work, RegisterVars[i].type, src, this, var);
+				return true;
+			}
+		}
+	}
+
+	// not predefined so just read the next token and add it to the state
+	idToken tok;
+	idWinInt *vari;
+	idWinFloat *varf;
+	idWinStr *vars;
+	if (!src->ReadToken(&tok)) {
+		if ( var ) {
+			idWinBool *boolVar = dynamic_cast<idWinBool*>(var);
+			if ( boolVar ) {
+				*boolVar = true;
+			}
+		} else {
+			idWinBool *boolVar = new idWinBool();
+			*boolVar = true;
+			boolVar->SetName( work );
+			definedVars.Append( boolVar );
+		}
+		return true;
+	}
+
+	if (var) {
+		var->Set(tok);
+		return true;
+	}
+
+	// consume the rest of the line to avoid mis-parsing multi-value entries
+	idStr remainder;
+	src->ParseRestOfLine(remainder);
+	if (remainder.Length()) {
+		idStr combined = tok;
+		combined += " ";
+		combined += remainder;
+		vars = new idWinStr();
+		*vars = combined;
+		vars->SetName(work);
+		definedVars.Append(vars);
+		return true;
+	}
+
+	switch (tok.type) {
+		case TT_NUMBER : 
+			if (tok.subtype & TT_INTEGER) {
+				vari = new idWinInt();
+				*vari = atoi(tok);
+				vari->SetName(work);
+				definedVars.Append(vari);
+			} else if (tok.subtype & TT_FLOAT) {
+				varf = new idWinFloat();
+				*varf = atof(tok);
+				varf->SetName(work);
+				definedVars.Append(varf);
+			} else {
+				vars = new idWinStr();
+				*vars = tok;
+				vars->SetName(work);
+				definedVars.Append(vars);
+			}
+			break;
+		default :
+			vars = new idWinStr();
+			*vars = tok;
+			vars->SetName(work);
+			definedVars.Append(vars);
+			break;
+	}
+	return true;
+}
+
+/*
+================
+idWindow::SetInitialState
+================
+*/
+void idWindow::SetInitialState(const char *_name) {
+	if (strstr(name, "fade")) {
+		name = name;
+	}
+	name = _name;
+	matScalex = 1.0;
+	matScaley = 1.0;
+	forceAspectWidth = 640.0;
+	forceAspectHeight = 480.0;
+	noTime = false;
+	visible = true;
+	alwaysThink = false;
+	flags = 0;
+}
+
+/*
+================
+OpenQ4_ParseTimelineMilliseconds
+================
+*/
+static bool OpenQ4_ParseTimelineMilliseconds( const char *text, int &milliseconds ) {
+	if ( text == NULL || text[0] == '\0' ) {
+		return false;
+	}
+
+	bool negative = false;
+	if ( text[0] == '+' || text[0] == '-' ) {
+		negative = text[0] == '-';
+		text++;
+	}
+	if ( text[0] == '\0' ) {
+		return false;
+	}
+
+	uint64 magnitude = 0;
+	const uint64 magnitudeLimit = negative ? 2147483648ULL : 2147483647ULL;
+	for ( ; text[0] != '\0'; text++ ) {
+		if ( text[0] < '0' || text[0] > '9' ) {
+			return false;
+		}
+		const uint64 digit = static_cast<uint64>( text[0] - '0' );
+		if ( magnitude > ( magnitudeLimit - digit ) / 10ULL ) {
+			return false;
+		}
+		magnitude = magnitude * 10ULL + digit;
+	}
+
+	const int64 signedValue = negative ? -static_cast<int64>( magnitude ) : static_cast<int64>( magnitude );
+	milliseconds = static_cast<int>( signedValue );
+	return true;
+}
+
+/*
+================
+idWindow::Parse
+================
+*/
+bool idWindow::Parse( idParser *src, bool rebuild) {
+	UI_LegacyObservationParse(this,true,false);
+	idToken token, token2, token3, token4, token5, token6, token7;
+	idStr work;
+
+	if (rebuild) {
+		CleanUp();
+	}
+
+	drawWin_t dwt;
+
+	timeLineEvents.Clear();
+	transitions.Clear();
+
+	namedEvents.DeleteContents( true );
+
+	src->ExpectTokenType( TT_NAME, 0, &token );
+
+	SetInitialState(token);
+
+	src->ExpectTokenString( "{" );
+	src->ExpectAnyToken( &token );
+
+	bool ret = true;
+
+	// attach a window wrapper to the window if the gui editor is running
+#ifdef ID_ALLOW_TOOLS
+	if ( com_editors & EDITOR_GUI ) {
+		new rvGEWindowWrapper ( this, rvGEWindowWrapper::WT_NORMAL );
+	}
+#endif
+
+	while( token != "}" ) {
+		// track what was parsed so we can maintain it for the guieditor
+		src->SetMarker ( );
+
+		if ( token == "windowDef" || token == "animationDef" ) {
+			if (token == "animationDef") {
+				visible = false;
+				rect = idRectangle(0,0,0,0);
+			}
+			src->ExpectTokenType( TT_NAME, 0, &token );
+			token2 = token;
+			src->UnreadToken(&token);
+			drawWin_t *dw = FindChildByName(token2.c_str());
+			if (dw && dw->win) {
+				SaveExpressionParseState();
+				dw->win->Parse(src, rebuild);
+				RestoreExpressionParseState();
+			} else {
+				idWindow *win = new idWindow(dc, gui);
+				SaveExpressionParseState();
+				win->Parse(src, rebuild);
+				RestoreExpressionParseState();
+				win->SetParent(this);
+				dwt.simp = NULL;
+				dwt.win = NULL;
+				if (win->IsSimple()) {
+					idSimpleWindow *simple = new idSimpleWindow(win);
+					dwt.simp = simple;
+					drawWindows.Append(dwt);
+					delete win;
+				} else {
+					AddChild(win);
+					SetFocus(win,false);
+					dwt.win = win;
+					drawWindows.Append(dwt);
+				}
+			}
+		} 
+		else if ( token == "editDef" ) {
+			idEditWindow *win = new idEditWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "choiceDef" ) {
+			idChoiceWindow *win = new idChoiceWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "sliderDef" ) {
+			idSliderWindow *win = new idSliderWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "markerDef" ) {
+			idMarkerWindow *win = new idMarkerWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "bindDef" ) {
+			idBindWindow *win = new idBindWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "listDef" ) {
+			idListWindow *win = new idListWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "fieldDef" ) {
+			idFieldWindow *win = new idFieldWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "editorViewDef" ) {
+			idLevelEditorWindow *win = new idLevelEditorWindow( gui );
+			win->SetDC( dc );
+			SaveExpressionParseState();
+			win->Parse( src, rebuild );
+			RestoreExpressionParseState();
+			AddChild( win );
+			win->SetParent( this );
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append( dwt );
+		}
+		else if ( token == "renderDef" ) {
+			idRenderWindow *win = new idRenderWindow(dc, gui);
+		  	SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+		  	RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "gameSSDDef" ) {
+			idGameSSDWindow *win = new idGameSSDWindow(dc, gui);
+			SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+			RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "gameBearShootDef" ) {
+			idGameBearShootWindow *win = new idGameBearShootWindow(dc, gui);
+			SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+			RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+		else if ( token == "gameBustOutDef" ) {
+			idGameBustOutWindow *win = new idGameBustOutWindow(dc, gui);
+			SaveExpressionParseState();
+			win->Parse(src, rebuild);	
+			RestoreExpressionParseState();
+			AddChild(win);
+			win->SetParent(this);
+			dwt.simp = NULL;
+			dwt.win = win;
+			drawWindows.Append(dwt);
+		}
+// 
+//  added new onEvent
+		else if ( token == "onNamedEvent" ) {
+			// Read the event name
+			if ( !src->ReadToken(&token) ) {
+				src->Error( "Expected event name" );
+				return false;
+			}
+
+			rvNamedEvent* ev = new rvNamedEvent ( token );
+			
+			src->SetMarker ( );
+			
+			if ( !ParseScript ( src, *ev->mEvent ) ) {
+				delete ev;
+				ret = false;
+				break;
+			}
+
+			// If we are in the gui editor then add the internal var to the 
+			// the wrapper
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				idStr out;
+				
+				// Grab the string from the last marker
+				src->GetStringFromMarker ( str, false );
+				
+				// Parse it one more time to knock unwanted tabs out
+				idLexer src2( str, str.Length(), "", src->GetFlags() );
+				src2.ParseBracedSectionExact ( out, 1);
+				
+				// Save the script		
+				rvGEWindowWrapper::GetWrapper ( this )->GetScriptDict().Set ( va("onEvent %s", token.c_str()), out );
+			}
+#endif			
+			namedEvents.Append(ev);
+		}
+		else if ( token == "onTime" ) {
+			if ( !src->ReadToken(&token) ) {
+				src->Error( "Unexpected end of file" );
+				return false;
+			}
+
+			bool relativeTime = false;
+			const char *timeToken = token.c_str();
+			if ( token == "+" ) {
+				if ( !src->ReadToken( &token ) ) {
+					src->Error( "Unexpected end of file" );
+					return false;
+				}
+				relativeTime = true;
+				timeToken = token.c_str();
+			} else if ( timeToken[0] == '+' ) {
+				relativeTime = true;
+				timeToken++;
+			}
+			if ( timeToken[0] == '\0' ) {
+				src->Error( "Invalid onTime value" );
+				return false;
+			}
+
+			int eventTime = 0;
+			if ( !OpenQ4_ParseTimelineMilliseconds( timeToken, eventTime ) ) {
+				src->Error( "Invalid onTime value '%s'", timeToken );
+				return false;
+			}
+			if ( relativeTime ) {
+				const int previousTime = ( timeLineEvents.Num() > 0 ) ? timeLineEvents[ timeLineEvents.Num() - 1 ]->time : 0;
+				const int64 combinedTime = static_cast<int64>( eventTime ) + static_cast<int64>( previousTime );
+				if ( combinedTime < idMath::INT_MIN || combinedTime > idMath::INT_MAX ) {
+					src->Error( "onTime value '%s' overflows the timeline", timeToken );
+					return false;
+				}
+				eventTime = static_cast<int>( combinedTime );
+			}
+
+			idTimeLineEvent *ev = new idTimeLineEvent;
+			ev->time = eventTime;
+			
+			// reset the mark since we dont want it to include the time
+			src->SetMarker ( );
+
+			if (!ParseScript(src, *ev->event, &ev->time)) {
+				delete ev;
+				ret = false;
+				break;
+			}
+
+			// add the script to the wrappers script list
+			// If we are in the gui editor then add the internal var to the 
+			// the wrapper
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				idStr out;
+				
+				// Grab the string from the last marker
+				src->GetStringFromMarker ( str, false );
+				
+				// Parse it one more time to knock unwanted tabs out
+				idLexer src2( str, str.Length(), "", src->GetFlags() );
+				src2.ParseBracedSectionExact ( out, 1);
+				
+				// Save the script		
+				rvGEWindowWrapper::GetWrapper ( this )->GetScriptDict().Set ( va("onTime %d", ev->time), out );
+			}
+#endif
+			// this is a timeline event
+			ev->pending = true;
+			timeLineEvents.Append(ev);
+		}
+		else if ( token == "definefloat" ) {
+			src->ReadToken(&token);
+			work = token;
+			work.ToLower();
+			idWinFloat *varf = new idWinFloat();
+			varf->SetName(work);
+			definedVars.Append(varf);
+
+			// add the float to the editors wrapper dict
+			// Set the marker after the float name
+			src->SetMarker ( );
+
+			// Read in the float 
+			regList.AddReg(work, idRegister::FLOAT, src, this, varf);
+
+			// If we are in the gui editor then add the float to the defines
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				
+				// Grab the string from the last marker and save it in the wrapper
+				src->GetStringFromMarker ( str, true );							
+				rvGEWindowWrapper::GetWrapper ( this )->GetVariableDict().Set ( va("definefloat\t\"%s\"",token.c_str()), str );
+			}
+#endif
+		}
+		else if ( token == "definevec4" ) {
+			src->ReadToken(&token);
+			work = token;
+			work.ToLower();
+			idWinVec4 *var = new idWinVec4();
+			var->SetName(work);
+
+			// set the marker so we can determine what was parsed
+			// set the marker after the vec4 name
+			src->SetMarker ( );
+
+			// FIXME: how about we add the var to the desktop instead of this window so it won't get deleted
+			//        when this window is destoyed which even happens during parsing with simple windows ?
+			//definedVars.Append(var);
+			gui->GetDesktop()->definedVars.Append( var );
+			gui->GetDesktop()->regList.AddReg( work, idRegister::VEC4, src, gui->GetDesktop(), var );
+
+			// store the original vec4 for the editor
+			// If we are in the gui editor then add the float to the defines
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				
+				// Grab the string from the last marker and save it in the wrapper
+				src->GetStringFromMarker ( str, true );							
+				rvGEWindowWrapper::GetWrapper ( this )->GetVariableDict().Set ( va("definevec4\t\"%s\"",token.c_str()), str );
+			}
+#endif
+		}
+// jmarshall - quake 4 guis
+		else if (token == "defineicon") {
+			idToken keyToken;
+			idToken valueToken;
+			idToken extraToken;
+			int iconX = -1;
+			int iconY = -1;
+			int iconW = -1;
+			int iconH = -1;
+
+			if ( !src->ReadToken( &keyToken ) || !src->ReadToken( &valueToken ) ) {
+				common->Warning( "Window '%s' in gui '%s': malformed defineicon", GetName(), gui ? gui->GetSourceFile() : "" );
+				continue;
+			}
+
+			if ( src->ReadToken( &extraToken ) ) {
+				if ( extraToken == "," ) {
+					src->ReadToken( &extraToken );
+					iconX = extraToken.GetIntValue();
+					src->ExpectTokenString( "," );
+					src->ReadToken( &extraToken );
+					iconY = extraToken.GetIntValue();
+					src->ExpectTokenString( "," );
+					src->ReadToken( &extraToken );
+					iconW = extraToken.GetIntValue();
+					src->ExpectTokenString( "," );
+					src->ReadToken( &extraToken );
+					iconH = extraToken.GetIntValue();
+				} else {
+					src->UnreadToken( &extraToken );
+				}
+			}
+
+			if ( dc != NULL ) {
+				dc->RegisterIcon( keyToken.c_str(), valueToken.c_str(), iconX, iconY, iconW, iconH );
+			}
+		}
+// jmarshall end
+		else if ( token == "float" ) {
+			src->ReadToken(&token);
+			work = token;
+			work.ToLower();
+			idWinFloat *varf = new idWinFloat();
+			varf->SetName(work);
+			definedVars.Append(varf);
+
+			// add the float to the editors wrapper dict
+			// set the marker to after the float name
+			src->SetMarker ( );
+
+			// Parse the float
+			regList.AddReg(work, idRegister::FLOAT, src, this, varf);
+
+			// If we are in the gui editor then add the float to the defines
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				
+				// Grab the string from the last marker and save it in the wrapper
+				src->GetStringFromMarker ( str, true );							
+				rvGEWindowWrapper::GetWrapper ( this )->GetVariableDict().Set ( va("float\t\"%s\"",token.c_str()), str );
+			}
+#endif
+		}
+		else if (ParseScriptEntry(token, src)) {
+			// add the script to the wrappers script list
+			// If we are in the gui editor then add the internal var to the 
+			// the wrapper
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				idStr out;
+				
+				// Grab the string from the last marker
+				src->GetStringFromMarker ( str, false );
+				
+				// Parse it one more time to knock unwanted tabs out
+				idLexer src2( str, str.Length(), "", src->GetFlags() );
+				src2.ParseBracedSectionExact ( out, 1);
+				
+				// Save the script		
+				rvGEWindowWrapper::GetWrapper ( this )->GetScriptDict().Set ( token, out );
+			}
+#endif
+		} else if (ParseInternalVar(token, src)) {
+			// gui editor support		
+			// If we are in the gui editor then add the internal var to the 
+			// the wrapper
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				src->GetStringFromMarker ( str );
+				rvGEWindowWrapper::GetWrapper ( this )->SetStateKey ( token, str, false );
+			}
+#endif
+		}
+		else {
+			ParseRegEntry(token, src);
+			// hook into the main window parsing for the gui editor
+			// If we are in the gui editor then add the internal var to the 
+			// the wrapper
+#ifdef ID_ALLOW_TOOLS
+			if ( com_editors & EDITOR_GUI ) {
+				idStr str;
+				src->GetStringFromMarker ( str );
+				rvGEWindowWrapper::GetWrapper ( this )->SetStateKey ( token, str, false );
+			}
+#endif
+		} 
+		if ( !src->ReadToken( &token ) ) {
+			src->Error( "Unexpected end of file" );
+			ret = false;
+			break;
+		}
+	}
+
+	if (ret) {
+		EvalRegs(-1, true);
+	}
+
+	SetupFromState();
+	PostParse();
+
+	// hook into the main window parsing for the gui editor
+	// If we are in the gui editor then add the internal var to the 
+	// the wrapper
+#ifdef ID_ALLOW_TOOLS
+	if ( com_editors & EDITOR_GUI ) {
+		rvGEWindowWrapper::GetWrapper ( this )->Finish ( );
+	}
+#endif
+
+	UI_LegacyObservationParse(this,false,ret);
+	return ret;
+}
+
+/*
+================
+idWindow::FindSimpleWinByName
+================
+*/
+idSimpleWindow *idWindow::FindSimpleWinByName(const char *_name) {
+	int c = drawWindows.Num();
+	for (int i = 0; i < c; i++) {
+		if (drawWindows[i].simp == NULL) {
+			continue;
+		}
+		if ( idStr::Icmp(drawWindows[i].simp->name, _name) == 0 ) {
+			return drawWindows[i].simp;
+		} 
+	}
+	return NULL;
+}
+
+/*
+================
+idWindow::FindChildByName
+================
+*/
+drawWin_t *idWindow::FindChildByName(const char *_name) {
+	static drawWin_t dw;
+	if (idStr::Icmp(name,_name) == 0) {
+		dw.simp = NULL;
+		dw.win = this;
+		return &dw;
+	}
+	int c = drawWindows.Num();
+	for (int i = 0; i < c; i++) {
+		if (drawWindows[i].win) {
+			if (idStr::Icmp(drawWindows[i].win->name, _name) == 0) {
+				return &drawWindows[i];
+			}
+			drawWin_t *win = drawWindows[i].win->FindChildByName(_name);
+			if (win) {
+				return win;
+			}
+		} else {
+			if (idStr::Icmp(drawWindows[i].simp->name, _name) == 0) {
+				return &drawWindows[i];
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
+================
+idWindow::GetStrPtrByName
+================
+*/
+idStr* idWindow::GetStrPtrByName(const char *_name) {
+	return NULL;
+}
+
+/*
+================
+idWindow::AddTransition
+================
+*/
+void idWindow::AddTransition(idWinVar *dest, idVec4 from, idVec4 to, int time, float accelTime, float decelTime) {
+	idTransitionData data;
+	data.data = dest;
+	data.interp.Init(gui->GetTime(), accelTime * time, decelTime * time, time, from, to);
+	transitions.Append(data);
+}
+
+
+/*
+================
+idWindow::StartTransition
+================
+*/
+void idWindow::StartTransition() {
+	flags |= WIN_INTRANSITION;
+}
+
+/*
+================
+idWindow::ResetCinematics
+================
+*/
+void idWindow::ResetCinematics() {
+	if ( background ) {
+		background->ResetCinematicTime( gui->GetTime() );
+	}
+}
+
+/*
+================
+idWindow::IsBackgroundCinematicComplete
+================
+*/
+bool idWindow::IsBackgroundCinematicComplete() const {
+	if ( background == NULL || gui == NULL || background->CinematicLength() <= 0 ) {
+		return false;
+	}
+
+	const int status = background->CinematicStatus( gui->GetTime() );
+	return ( status == FMV_EOF || status == FMV_IDLE || status == FMV_LOOPED );
+}
+
+/*
+================
+idWindow::ResetTime
+================
+*/
+void idWindow::ResetTime(int t) {
+
+	timeLine = gui->GetTime() - t;
+
+	int i, c = timeLineEvents.Num();
+	for ( i = 0; i < c; i++ ) {
+		if ( timeLineEvents[i]->time >= t ) {
+			timeLineEvents[i]->pending = true;
+		}
+	}
+
+	noTime = false;
+
+	c = transitions.Num();
+	for ( i = 0; i < c; i++ ) {
+		idTransitionData *data = &transitions[i];
+		if ( data->interp.IsDone( gui->GetTime() ) && data->data ) {
+			transitions.RemoveIndex( i );
+			i--;
+			c--;
+		}
+	}
+
+}
+
+
+/*
+================
+idWindow::RunScriptList
+================
+*/
+bool idWindow::RunScriptList(idGuiScriptList *src) {
+	if (src == NULL) {
+		return false;
+	}
+	if ( !idGuiScriptList::IsValid( src ) ) {
+		common->Warning( "GUI: skipping invalid script list %p for window %p", src, this );
+		return false;
+	}
+	src->Execute(this);
+	return true;
+}
+
+/*
+================
+idWindow::RunScript
+================
+*/
+bool idWindow::RunScript(int n) {
+	if (n >= ON_MOUSEENTER && n < SCRIPT_COUNT) {
+		return RunScriptList(scripts[n]);
+	}
+	return false;
+}
+
+/*
+================
+idWindow::ExpressionConstant
+================
+*/
+int idWindow::ExpressionConstant(float f) {
+	int		i;
+
+	for ( i = WEXP_REG_NUM_PREDEFINED ; i < expressionRegisters.Num() ; i++ ) {
+		if ( !registerIsTemporary[i] && expressionRegisters[i] == f ) {
+			return i;
+		}
+	}
+	if ( expressionRegisters.Num() == MAX_EXPRESSION_REGISTERS ) {
+		common->Warning( "expressionConstant: gui %s hit MAX_EXPRESSION_REGISTERS", gui->GetSourceFile() );
+		return 0;
+	}
+
+	int c = expressionRegisters.Num();
+	if (i > c) {
+		while (i > c) {
+			expressionRegisters.Append(-9999999);
+			i--;
+		}
+	}
+
+	i = expressionRegisters.Append(f);
+	registerIsTemporary[i] = false;
+	return i;
+}
+
+/*
+================
+idWindow::ExpressionTemporary
+================
+*/
+int idWindow::ExpressionTemporary() {
+	if ( expressionRegisters.Num() == MAX_EXPRESSION_REGISTERS ) {
+		common->Warning( "expressionTemporary: gui %s hit MAX_EXPRESSION_REGISTERS", gui->GetSourceFile());
+		return 0;
+	}
+	int i = expressionRegisters.Num();
+	registerIsTemporary[i] = true;
+	i = expressionRegisters.Append(0);
+	return i;
+}
+
+/*
+================
+idWindow::ExpressionOp
+================
+*/
+wexpOp_t *idWindow::ExpressionOp() {
+	if (numOps == MAX_EXPRESSION_OPS ) {
+		common->Warning( "expressionOp: gui %s hit MAX_EXPRESSION_OPS", gui->GetSourceFile());
+		return &ops[0];
+	}
+	ops.emplace_back();
+	return &ops[numOps++];
+}
+
+/*
+================
+idWindow::EmitOp
+================
+*/
+
+int idWindow::EmitOp(intptr_t a, intptr_t b, wexpOpType_t opType, wexpOp_t **opp ) {
+	wexpOp_t *op;
+/*
+	// optimize away identity operations
+	if ( opType == WOP_TYPE_ADD ) {
+		if ( !registerIsTemporary[a] && shaderRegisters[a] == 0 ) {
+			return b;
+		}
+		if ( !registerIsTemporary[b] && shaderRegisters[b] == 0 ) {
+			return a;
+		}
+		if ( !registerIsTemporary[a] && !registerIsTemporary[b] ) {
+			return ExpressionConstant( shaderRegisters[a] + shaderRegisters[b] );
+		}
+	}
+	if ( opType == WOP_TYPE_MULTIPLY ) {
+		if ( !registerIsTemporary[a] && shaderRegisters[a] == 1 ) {
+			return b;
+		}
+		if ( !registerIsTemporary[a] && shaderRegisters[a] == 0 ) {
+			return a;
+		}
+		if ( !registerIsTemporary[b] && shaderRegisters[b] == 1 ) {
+			return a;
+		}
+		if ( !registerIsTemporary[b] && shaderRegisters[b] == 0 ) {
+			return b;
+		}
+		if ( !registerIsTemporary[a] && !registerIsTemporary[b] ) {
+			return ExpressionConstant( shaderRegisters[a] * shaderRegisters[b] );
+		}
+	}
+*/
+	op = ExpressionOp();
+
+	op->opType = opType;
+	op->a = a;
+	op->b = b;
+	op->c = ExpressionTemporary();
+
+	if (opp) {
+		*opp = op;
+	}
+	return op->c;
+}
+
+/*
+================
+idWindow::ParseEmitOp
+================
+*/
+intptr_t idWindow::ParseEmitOp( idParser *src, intptr_t a, wexpOpType_t opType, int priority, wexpOp_t **opp ) {
+	intptr_t b = ParseExpressionPriority( src, priority );
+	return EmitOp( a, b, opType, opp );  
+}
+
+
+/*
+================
+idWindow::ParseTerm
+
+Returns a register index
+=================
+*/
+intptr_t idWindow::ParseTerm( idParser *src,	idWinVar *var, intptr_t component ) {
+	idToken token;
+	intptr_t a, b;
+
+	src->ReadToken( &token );
+
+	if ( token == "(" ) {
+		a = ParseExpression( src );
+		src->ExpectTokenString(")");
+		return a;
+	}
+
+	if ( !token.Icmp( "time" ) ) {
+		return WEXP_REG_TIME;
+	}
+
+	// parse negative numbers
+	if ( token == "-" ) {
+		src->ReadToken( &token );
+		if ( token.type == TT_NUMBER || token == "." ) {
+			return ExpressionConstant( -(float) token.GetFloatValue() );
+		}
+		src->Warning( "Bad negative number '%s'", token.c_str() );
+		return 0;
+	}
+
+	if ( token.type == TT_NUMBER || token == "." || token == "-" ) {
+		return ExpressionConstant( (float) token.GetFloatValue() );
+	}
+
+	// see if it is a table name
+	const idDeclTable *table = static_cast<const idDeclTable *>( declManager->FindType( DECL_TABLE, token.c_str(), false ) );
+	const unsigned observation = UI_LegacyObservationActive(this) ?
+		UI_LegacyObservationTerm(this,src,token,table ? table->Index() : -1) : 0;
+	const auto emit = [&](intptr_t left, intptr_t right, wexpOpType_t type) {
+		const int result = EmitOp(left,right,type);
+		UI_LegacyObservationOp(this,observation,numOps-1,result,type,left,right);
+		return result;
+	};
+	if ( table ) {
+		a = table->Index();
+		// parse a table expression
+		src->ExpectTokenString("[");
+		b = ParseExpression(src);
+		src->ExpectTokenString("]");
+		return emit( a, b, WOP_TYPE_TABLE );
+	}
+	
+	if (var == NULL) {
+		var = GetWinVarByName(token, true);
+	}
+	if (var) {
+		a = (intptr_t)var;
+		//assert(dynamic_cast<idWinVec4*>(var));
+		var->Init(token, this);
+		b = component;
+		if (dynamic_cast<idWinVec4*>(var)) {
+			if (src->ReadToken(&token)) {
+				if (token == "[") {
+					b = ParseExpression(src);
+					src->ExpectTokenString("]");
+				} else {
+					src->UnreadToken(&token);
+				}
+			}
+			return emit(a, b, WOP_TYPE_VAR);
+		} else if (dynamic_cast<idWinFloat*>(var)) {
+			return emit(a, b, WOP_TYPE_VARF);
+		} else if (dynamic_cast<idWinInt*>(var)) {
+			return emit(a, b, WOP_TYPE_VARI);
+		} else if (dynamic_cast<idWinBool*>(var)) {
+			return emit(a, b, WOP_TYPE_VARB);
+		} else if (dynamic_cast<idWinStr*>(var)) {
+			return emit(a, b, WOP_TYPE_VARS);
+		} else {
+			src->Warning("Var expression not vec4, float or int '%s'", token.c_str());
+		}
+		return 0;
+	} else {
+		// ugly but used for post parsing to fixup named vars
+		char *p = new char[token.Length()+1];
+		idStr::Copynz( p, token.c_str(), token.Length() + 1 );
+		a = (intptr_t)p;
+		b = -2;
+		return emit(a, b, WOP_TYPE_VAR);
+	}
+
+}
+
+/*
+=================
+idWindow::ParseExpressionPriority
+
+Returns a register index
+=================
+*/
+#define	TOP_PRIORITY 4
+intptr_t idWindow::ParseExpressionPriority( idParser *src, int priority, idWinVar *var, intptr_t component ) {
+	idToken token;
+	intptr_t		a;
+
+	if ( priority == 0 ) {
+		return ParseTerm( src, var, component );
+	}
+
+	a = ParseExpressionPriority( src, priority - 1, var, component );
+
+	if ( !src->ReadToken( &token ) ) {
+		// we won't get EOF in a real file, but we can
+		// when parsing from generated strings
+		return a;
+	}
+
+	if ( priority == 1 && token == "*" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_MULTIPLY, priority );
+	}
+	if ( priority == 1 && token == "/" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_DIVIDE, priority );
+	}
+	if ( priority == 1 && token == "%" ) {	// implied truncate both to integer
+		return ParseEmitOp( src, a, WOP_TYPE_MOD, priority );
+	}
+	if ( priority == 2 && token == "+" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_ADD, priority );
+	}
+	if ( priority == 2 && token == "-" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_SUBTRACT, priority );
+	}
+	if ( priority == 3 && token == ">" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_GT, priority );
+	}
+	if ( priority == 3 && token == ">=" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_GE, priority );
+	}
+	if ( priority == 3 && token == "<" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_LT, priority );
+	}
+	if ( priority == 3 && token == "<=" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_LE, priority );
+	}
+	if ( priority == 3 && token == "==" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_EQ, priority );
+	}
+	if ( priority == 3 && token == "!=" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_NE, priority );
+	}
+	if ( priority == 4 && token == "&&" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_AND, priority );
+	}
+	if ( priority == 4 && token == "||" ) {
+		return ParseEmitOp( src, a, WOP_TYPE_OR, priority );
+	}
+	if ( priority == 4 && token == "?" ) {
+		wexpOp_t *oop = NULL;
+		intptr_t o = ParseEmitOp( src, a, WOP_TYPE_COND, priority, &oop );
+		if ( !src->ReadToken( &token ) ) {
+			return o;
+		}
+		if (token == ":") {
+			a = ParseExpressionPriority( src, priority - 1, var );
+			oop->d = a;
+		}
+		return o;
+	}
+
+	// assume that anything else terminates the expression
+	// not too robust error checking...
+
+	src->UnreadToken( &token );
+
+	return a;
+}
+
+/*
+================
+idWindow::ParseExpression
+
+Returns a register index
+================
+*/
+intptr_t idWindow::ParseExpression(idParser *src, idWinVar *var, intptr_t component) {
+	return ParseExpressionPriority( src, TOP_PRIORITY, var );
+}
+
+/*
+================
+idWindow::ParseBracedExpression
+================
+*/
+void idWindow::ParseBracedExpression(idParser *src) {
+	src->ExpectTokenString("{");
+	ParseExpression(src);
+	src->ExpectTokenString("}");
+}
+
+/*
+===============
+idWindow::EvaluateRegisters
+
+Parameters are taken from the localSpace and the renderView,
+then all expressions are evaluated, leaving the shader registers
+set to their apropriate values.
+===============
+*/
+void idWindow::EvaluateRegisters(float *registers) {
+	int		i, b;
+	wexpOp_t	*op;
+	idVec4 v;
+
+	int erc = expressionRegisters.Num();
+	int oc = numOps;
+	// copy the constants
+	for ( i = WEXP_REG_NUM_PREDEFINED ; i < erc ; i++ ) {
+		registers[i] = expressionRegisters[i];
+	}
+
+	// copy the local and global parameters
+	registers[WEXP_REG_TIME] = gui->GetTime();
+
+	for ( i = 0 ; i < oc ; i++ ) {
+		op = &ops[i];
+		if (op->b == -2) {
+			continue;
+		}
+		switch( op->opType ) {
+		case WOP_TYPE_ADD:
+			registers[op->c] = registers[op->a] + registers[op->b];
+			break;
+		case WOP_TYPE_SUBTRACT:
+			registers[op->c] = registers[op->a] - registers[op->b];
+			break;
+		case WOP_TYPE_MULTIPLY:
+			registers[op->c] = registers[op->a] * registers[op->b];
+			break;
+		case WOP_TYPE_DIVIDE:
+			if ( registers[op->b] == 0.0f ) {
+				common->Warning( "Divide by zero in window '%s' in %s", GetName(), gui->GetSourceFile() );
+				registers[op->c] = registers[op->a];
+			} else {
+				registers[op->c] = registers[op->a] / registers[op->b];
+			}
+			break;
+		case WOP_TYPE_MOD:
+			b = (int)registers[op->b];
+			b = b != 0 ? b : 1;
+			registers[op->c] = (int)registers[op->a] % b;
+			break;
+		case WOP_TYPE_TABLE:
+			{
+				const idDeclTable *table = static_cast<const idDeclTable *>( declManager->DeclByIndex( DECL_TABLE, op->a ) );
+				registers[op->c] = table->TableLookup( registers[op->b] );
+			}
+			break;
+		case WOP_TYPE_GT:
+			registers[op->c] = registers[ op->a ] > registers[op->b];
+			break;
+		case WOP_TYPE_GE:
+			registers[op->c] = registers[ op->a ] >= registers[op->b];
+			break;
+		case WOP_TYPE_LT:
+			registers[op->c] = registers[ op->a ] < registers[op->b];
+			break;
+		case WOP_TYPE_LE:
+			registers[op->c] = registers[ op->a ] <= registers[op->b];
+			break;
+		case WOP_TYPE_EQ:
+			registers[op->c] = registers[ op->a ] == registers[op->b];
+			break;
+		case WOP_TYPE_NE:
+			registers[op->c] = registers[ op->a ] != registers[op->b];
+			break;
+		case WOP_TYPE_COND:
+			registers[op->c] = (registers[ op->a ]) ? registers[op->b] : registers[op->d];
+			break;
+		case WOP_TYPE_AND:
+			registers[op->c] = registers[ op->a ] && registers[op->b];
+			break;
+		case WOP_TYPE_OR:
+			registers[op->c] = registers[ op->a ] || registers[op->b];
+			break;
+		case WOP_TYPE_VAR:
+			if ( !op->a ) {
+				registers[op->c] = 0.0f;
+				break;
+			}
+			if ( op->b >= 0 && registers[op->b] >= 0 && registers[op->b] < 4 ) {
+				// grabs vector components
+				idWinVec4 *var = (idWinVec4 *)( op->a );
+				registers[op->c] = ((idVec4&)var)[registers[op->b]];
+			} else {
+				registers[op->c] = ((idWinVar*)(op->a))->x();
+			}
+			break;
+		case WOP_TYPE_VARS:
+			if (op->a) {
+				idWinStr *var = (idWinStr*)(op->a);
+				registers[op->c] = atof(var->c_str());
+			} else {
+				registers[op->c] = 0;
+			}
+			break;
+		case WOP_TYPE_VARF:
+			if (op->a) {
+				idWinFloat *var = (idWinFloat*)(op->a);
+				registers[op->c] = *var;
+			} else {
+				registers[op->c] = 0;
+			}
+			break;
+		case WOP_TYPE_VARI:
+			if (op->a) {
+				idWinInt *var = (idWinInt*)(op->a);
+				registers[op->c] = *var;
+			} else {
+				registers[op->c] = 0;
+			}
+			break;
+		case WOP_TYPE_VARB:
+			if (op->a) {
+				idWinBool *var = (idWinBool*)(op->a);
+				registers[op->c] = *var;
+			} else {
+				registers[op->c] = 0;
+			}
+			break;
+		default:
+			common->FatalError( "R_EvaluateExpression: bad opcode" );
+		}
+	}
+
+}
+
+/*
+================
+idWindow::ReadFromDemoFile
+================
+*/
+void idWindow::ReadFromDemoFile( class idDemoFile *f, bool rebuild ) {
+
+	// should never hit unless we re-enable WRITE_GUIS
+#ifndef WRITE_GUIS
+	assert( false );
+#else
+
+	if (rebuild) {
+		CommonInit();
+	}
+	
+	f->SetLog(true, "window1");
+	backGroundName = f->ReadHashString();
+	f->SetLog(true, backGroundName);
+	if ( backGroundName[0] ) {
+		background = declManager->FindMaterial(backGroundName);
+	} else {
+		background = NULL;
+	}
+	f->ReadUnsignedChar( cursor );
+	f->ReadUnsignedInt( flags );
+	f->ReadInt( timeLine );
+	f->ReadInt( lastTimeRun );
+	idRectangle rct = rect;
+	f->ReadFloat( rct.x );
+	f->ReadFloat( rct.y );
+	f->ReadFloat( rct.w );
+	f->ReadFloat( rct.h );
+	f->ReadFloat( drawRect.x );
+	f->ReadFloat( drawRect.y );
+	f->ReadFloat( drawRect.w );
+	f->ReadFloat( drawRect.h );
+	f->ReadFloat( clientRect.x );
+	f->ReadFloat( clientRect.y );
+	f->ReadFloat( clientRect.w );
+	f->ReadFloat( clientRect.h );
+	f->ReadFloat( textRect.x );
+	f->ReadFloat( textRect.y );
+	f->ReadFloat( textRect.w );
+	f->ReadFloat( textRect.h );
+	f->ReadFloat( xOffset);
+	f->ReadFloat( yOffset);
+	int i, c;
+
+	idStr work;
+	if (rebuild) {
+		f->SetLog(true, (work + "-scripts"));
+		for (i = 0; i < SCRIPT_COUNT; i++) {
+			bool b;
+			f->ReadBool( b );
+			if (b) {
+				delete scripts[i];
+				scripts[i] = new idGuiScriptList;
+				scripts[i]->ReadFromDemoFile(f);
+			}
+		}
+
+		f->SetLog(true, (work + "-timelines"));
+		f->ReadInt( c );
+		for (i = 0; i < c; i++) {
+			idTimeLineEvent *tl = new idTimeLineEvent;
+			f->ReadInt( tl->time );
+			f->ReadBool( tl->pending );
+			tl->event->ReadFromDemoFile(f);
+			if (rebuild) {
+				timeLineEvents.Append(tl);
+			} else {
+				assert(i < timeLineEvents.Num());
+				timeLineEvents[i]->time = tl->time;
+				timeLineEvents[i]->pending = tl->pending;
+			}
+		}
+	}
+
+	f->SetLog(true, (work + "-transitions"));
+	f->ReadInt( c );
+	for (i = 0; i < c; i++) {
+		idTransitionData td;
+		td.data = NULL;
+		f->ReadInt ( td.offset );
+
+		float startTime, accelTime, linearTime, decelTime;
+		idVec4 startValue, endValue;	   
+		f->ReadFloat( startTime );
+		f->ReadFloat( accelTime );
+		f->ReadFloat( linearTime );
+		f->ReadFloat( decelTime );
+		f->ReadVec4( startValue );
+		f->ReadVec4( endValue );
+		td.interp.Init( startTime, accelTime, decelTime, accelTime + linearTime + decelTime, startValue, endValue );
+		
+		// read this for correct data padding with the win32 savegames
+		// the extrapolate is correctly initialized through the above Init call
+		int extrapolationType;
+		float duration;
+		idVec4 baseSpeed, speed;
+		float currentTime;
+		idVec4 currentValue;
+		f->ReadInt( extrapolationType );
+		f->ReadFloat( startTime );
+		f->ReadFloat( duration );
+		f->ReadVec4( startValue );
+		f->ReadVec4( baseSpeed );
+		f->ReadVec4( speed );
+		f->ReadFloat( currentTime );
+		f->ReadVec4( currentValue );
+
+		transitions.Append(td);
+	}
+
+	f->SetLog(true, (work + "-regstuff"));
+	if (rebuild) {
+		f->ReadInt( c );
+		for (i = 0; i < c; i++) {
+			wexpOp_t w;
+			f->ReadInt( (int&)w.opType );
+			f->ReadInt( w.a );
+			f->ReadInt( w.b );
+			f->ReadInt( w.c );
+			f->ReadInt( w.d );
+			ops.push_back(w);
+			++numOps;
+		}
+
+		f->ReadInt( c );
+		for (i = 0; i < c; i++) {
+			float ff;
+			f->ReadFloat( ff );
+			expressionRegisters.Append(ff);
+		}
+	
+		regList.ReadFromDemoFile(f);
+
+	}
+	f->SetLog(true, (work + "-children"));
+	f->ReadInt( c );
+	for (i = 0; i < c; i++) {
+		if (rebuild) {
+			idWindow *win = new idWindow(dc, gui);
+			win->ReadFromDemoFile(f);
+			AddChild(win);
+		} else {
+			for (int j = 0; j < c; j++) {
+				if (children[j]->childID == i) {
+					children[j]->ReadFromDemoFile(f,rebuild);
+					break;
+				} else {
+					continue;
+				}
+			}
+		}
+	}
+#endif /* WRITE_GUIS */
+}
+
+/*
+================
+idWindow::WriteToDemoFile
+================
+*/
+void idWindow::WriteToDemoFile( class idDemoFile *f ) {
+	// should never hit unless we re-enable WRITE_GUIS
+#ifndef WRITE_GUIS
+	assert( false );
+#else
+
+	f->SetLog(true, "window");
+	f->WriteHashString(backGroundName);
+	f->SetLog(true, backGroundName);
+	f->WriteUnsignedChar( cursor );
+	f->WriteUnsignedInt( flags );
+	f->WriteInt( timeLine );
+	f->WriteInt( lastTimeRun );
+	idRectangle rct = rect;
+	f->WriteFloat( rct.x );
+	f->WriteFloat( rct.y );
+	f->WriteFloat( rct.w );
+	f->WriteFloat( rct.h );
+	f->WriteFloat( drawRect.x );
+	f->WriteFloat( drawRect.y );
+	f->WriteFloat( drawRect.w );
+	f->WriteFloat( drawRect.h );
+	f->WriteFloat( clientRect.x );
+	f->WriteFloat( clientRect.y );
+	f->WriteFloat( clientRect.w );
+	f->WriteFloat( clientRect.h );
+	f->WriteFloat( textRect.x );
+	f->WriteFloat( textRect.y );
+	f->WriteFloat( textRect.w );
+	f->WriteFloat( textRect.h );
+	f->WriteFloat( xOffset );
+	f->WriteFloat( yOffset );
+	idStr work;
+	f->SetLog(true, work);
+
+ 	int i, c;
+
+	f->SetLog(true, (work + "-transitions"));
+	c = transitions.Num();
+	f->WriteInt( c );
+	for (i = 0; i < c; i++) {
+		f->WriteInt( 0 );
+		f->WriteInt( transitions[i].offset );
+		
+		f->WriteFloat( transitions[i].interp.GetStartTime() );
+		f->WriteFloat( transitions[i].interp.GetAccelTime() );
+		f->WriteFloat( transitions[i].interp.GetLinearTime() );
+		f->WriteFloat( transitions[i].interp.GetDecelTime() );
+		f->WriteVec4( transitions[i].interp.GetStartValue() );
+		f->WriteVec4( transitions[i].interp.GetEndValue() );
+
+		// write to keep win32 render demo format compatiblity - we don't actually read them back anymore
+		f->WriteInt( transitions[i].interp.GetExtrapolate()->GetExtrapolationType() );
+		f->WriteFloat( transitions[i].interp.GetExtrapolate()->GetStartTime() );
+		f->WriteFloat( transitions[i].interp.GetExtrapolate()->GetDuration() );
+		f->WriteVec4( transitions[i].interp.GetExtrapolate()->GetStartValue() );
+		f->WriteVec4( transitions[i].interp.GetExtrapolate()->GetBaseSpeed() );
+		f->WriteVec4( transitions[i].interp.GetExtrapolate()->GetSpeed() );
+		f->WriteFloat( transitions[i].interp.GetExtrapolate()->GetCurrentTime() );
+		f->WriteVec4( transitions[i].interp.GetExtrapolate()->GetCurrentValue() );
+	}
+
+	f->SetLog(true, (work + "-regstuff"));
+
+	f->SetLog(true, (work + "-children"));
+	c = children.Num();
+	f->WriteInt( c );
+	for (i = 0; i < c; i++) {
+		for (int j = 0; j < c; j++) {
+			if (children[j]->childID == i) {
+				children[j]->WriteToDemoFile(f);
+				break;
+			} else {
+				continue;
+			}
+		}
+	}
+#endif /* WRITE_GUIS */
+}
+
+/*
+===============
+idWindow::WriteString
+===============
+*/
+static bool OpenQ4_IsFiniteSaveGameRectangle( const idRectangle &rect ) {
+	return std::isfinite( rect.x ) && std::isfinite( rect.y ) &&
+		std::isfinite( rect.w ) && std::isfinite( rect.h );
+}
+
+static bool OpenQ4_IsFiniteSaveGameVec2( const idVec2 &vec ) {
+	return std::isfinite( vec.x ) && std::isfinite( vec.y );
+}
+
+bool idWindow::WriteSaveGameString( const char *string, idFile *savefile ) {
+	if ( savefile == NULL || string == NULL ) {
+		common->Error( "idWindow::WriteSaveGameString: invalid output file/string for window '%s'",
+			name.c_str() );
+		return false;
+	}
+	const int len = idLib::SizeToInt( strlen( string ), "idWindow::WriteSaveGameString" );
+	const int maxSavedStringLength = 64 * 1024;
+	if ( len > maxSavedStringLength ) {
+		common->Error( "idWindow::WriteSaveGameString: string for window '%s' in gui '%s' is too long (%d bytes)",
+			name.c_str(), gui ? gui->GetSourceFile() : "<null>", len );
+		return false;
+	}
+	if ( !OpenQ4_WriteSaveGameInt( savefile, len, "idWindow::WriteSaveGameString", "length" ) ) {
+		return false;
+	}
+	if ( len > 0 ) {
+		if ( !OpenQ4_WriteSaveGameBytes( savefile, string, len, "idWindow::WriteSaveGameString", "string" ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+The floats of a transition's interpolator through the typed GUI field helpers,
+as a SaveCodec writer and reader (idlib/SaveCodec.h). The helpers report a
+failed write or a truncated read through common->Error. A GUI expression can
+leave a non-finite value in a transition; it is saved as zero, as
+OpenQ4_SanitizeSaveGameWinVar saves the variables themselves.
+*/
+struct windowSaveGameFloats_t {
+	idFile *	file;
+	bool		ok;
+
+	void		WriteFloat( float value ) {
+					ok = ok && OpenQ4_WriteSaveGameFloat( file, std::isfinite( value ) ? value : 0.0f,
+						"idWindow::WriteSaveGameTransition", "interpolate state" );
+				}
+	void		ReadFloat( float &value ) {
+					value = 0.0f;
+					ok = ok && OpenQ4_ReadSaveGameFloat( file, value, "idWindow::ReadSaveGameTransition", "interpolate state" );
+				}
+};
+
+/*
+===============
+idWindow::WriteSaveGameTransition
+===============
+*/
+bool idWindow::WriteSaveGameTransition( idTransitionData &trans, idFile *savefile ) {
+	if ( savefile == NULL || gui == NULL || gui->GetDesktop() == NULL || trans.data == NULL ) {
+		common->Error( "idWindow::WriteSaveGameTransition: invalid transition context for window '%s'",
+			name.c_str() );
+		return false;
+	}
+	drawWin_t dw;
+	dw.simp = NULL;
+	dw.win = NULL;
+	const intptr_t transitionOffset = gui->GetDesktop()->GetWinVarOffset( trans.data, &dw );
+	if ( transitionOffset == -1 && dw.win == NULL && dw.simp == NULL ) {
+		// A gui-declared var ("float rotate1", "definevec4 ...") is not a member of
+		// idWindow, so it has no offset and can never be re-addressed on restore.
+		// The original engine dropped these from the save rather than failing, and
+		// ReadSaveGameTransition still treats -1 as "no transition", so keep that
+		// behaviour: erroring here aborts an autosave the player cannot avoid.
+		// A resolved offset with a mismatched or missing owner is still genuinely
+		// inconsistent and keeps failing below.
+		common->DPrintf( "idWindow::WriteSaveGameTransition: dropping transition on non-member var"
+			" for window '%s' in gui '%s'\n", name.c_str(), gui->GetSourceFile() );
+		return OpenQ4_WriteSaveGameInt( savefile, -1, "idWindow::WriteSaveGameTransition", "target offset" );
+	}
+	if ( transitionOffset < 0 || transitionOffset > 0x7fffffff || ( dw.win == NULL ) == ( dw.simp == NULL ) ) {
+		common->Error( "idWindow::WriteSaveGameTransition: could not resolve transition target for window '%s' in gui '%s'",
+			name.c_str(), gui->GetSourceFile() );
+		return false;
+	}
+	const idStr winName = ( dw.win != NULL ) ? dw.win->GetName() : dw.simp->name.c_str();
+	drawWin_t *foundWindow = gui->GetDesktop()->FindChildByName( winName );
+	if ( winName.IsEmpty() || foundWindow == NULL || foundWindow->win != dw.win || foundWindow->simp != dw.simp ) {
+		common->Error( "idWindow::WriteSaveGameTransition: transition target '%s' for window '%s' in gui '%s' is missing or ambiguous",
+			winName.c_str(), name.c_str(), gui->GetSourceFile() );
+		return false;
+	}
+	const int savedTarget = TransitionFieldIndex( dw.simp != NULL, transitionOffset );
+	if ( savedTarget < 0 ) {
+		common->Error( "idWindow::WriteSaveGameTransition: transition target '%s' for window '%s' in gui '%s' drives no saved field",
+			winName.c_str(), name.c_str(), gui->GetSourceFile() );
+		return false;
+	}
+	windowSaveGameFloats_t out = { savefile, true };
+	if ( !OpenQ4_WriteSaveGameInt( savefile, savedTarget, "idWindow::WriteSaveGameTransition", "target field" ) ||
+		 !WriteSaveGameString( winName, savefile ) ) {
+		return false;
+	}
+	SaveCodec_WriteInterpolate( out, trans.interp );
+	return out.ok;
+}
+
+openQ4SaveGameRestore_t openQ4_saveGameRestore = { NULL, 0, 0 };
+
+/*
+===============
+idWindow::TransitionFieldOffset
+
+The window variables a transition can drive, in a fixed order. Payload version
+5 saves a transition's target variable as its index here. Earlier payloads saved
+the variable's byte offset in its window class, which follows the compiler's
+layout of that class, so it only resolved on the ABI that wrote it.
+===============
+*/
+intptr_t idWindow::TransitionFieldOffset( bool simple, int index ) {
+	if ( simple ) {
+		switch ( index ) {
+			case 0: return (intptr_t)&( ( idSimpleWindow * ) 0 )->rect;
+			case 1: return (intptr_t)&( ( idSimpleWindow * ) 0 )->backColor;
+			case 2: return (intptr_t)&( ( idSimpleWindow * ) 0 )->matColor;
+			case 3: return (intptr_t)&( ( idSimpleWindow * ) 0 )->foreColor;
+			case 4: return (intptr_t)&( ( idSimpleWindow * ) 0 )->borderColor;
+			case 5: return (intptr_t)&( ( idSimpleWindow * ) 0 )->textScale;
+			case 6: return (intptr_t)&( ( idSimpleWindow * ) 0 )->rotate;
+			default: return -1;
+		}
+	}
+	switch ( index ) {
+		case 0: return (intptr_t)&( ( idWindow * ) 0 )->rect;
+		case 1: return (intptr_t)&( ( idWindow * ) 0 )->backColor;
+		case 2: return (intptr_t)&( ( idWindow * ) 0 )->backColor_r;
+		case 3: return (intptr_t)&( ( idWindow * ) 0 )->backColor_g;
+		case 4: return (intptr_t)&( ( idWindow * ) 0 )->backColor_b;
+		case 5: return (intptr_t)&( ( idWindow * ) 0 )->backColor_w;
+		case 6: return (intptr_t)&( ( idWindow * ) 0 )->matColor;
+		case 7: return (intptr_t)&( ( idWindow * ) 0 )->matColor_r;
+		case 8: return (intptr_t)&( ( idWindow * ) 0 )->matColor_g;
+		case 9: return (intptr_t)&( ( idWindow * ) 0 )->matColor_b;
+		case 10: return (intptr_t)&( ( idWindow * ) 0 )->matColor_w;
+		case 11: return (intptr_t)&( ( idWindow * ) 0 )->foreColor;
+		case 12: return (intptr_t)&( ( idWindow * ) 0 )->foreColor_r;
+		case 13: return (intptr_t)&( ( idWindow * ) 0 )->foreColor_g;
+		case 14: return (intptr_t)&( ( idWindow * ) 0 )->foreColor_b;
+		case 15: return (intptr_t)&( ( idWindow * ) 0 )->foreColor_w;
+		case 16: return (intptr_t)&( ( idWindow * ) 0 )->hoverColor;
+		case 17: return (intptr_t)&( ( idWindow * ) 0 )->hoverColor_r;
+		case 18: return (intptr_t)&( ( idWindow * ) 0 )->hoverColor_g;
+		case 19: return (intptr_t)&( ( idWindow * ) 0 )->hoverColor_b;
+		case 20: return (intptr_t)&( ( idWindow * ) 0 )->hoverColor_w;
+		case 21: return (intptr_t)&( ( idWindow * ) 0 )->borderColor;
+		case 22: return (intptr_t)&( ( idWindow * ) 0 )->borderColor_r;
+		case 23: return (intptr_t)&( ( idWindow * ) 0 )->borderColor_g;
+		case 24: return (intptr_t)&( ( idWindow * ) 0 )->borderColor_b;
+		case 25: return (intptr_t)&( ( idWindow * ) 0 )->borderColor_w;
+		case 26: return (intptr_t)&( ( idWindow * ) 0 )->textScale;
+		case 27: return (intptr_t)&( ( idWindow * ) 0 )->rotate;
+		default: return -1;
+	}
+}
+
+// The index of the transition field at a byte offset, or -1.
+int idWindow::TransitionFieldIndex( bool simple, intptr_t offset ) {
+	for ( int index = 0; ; index++ ) {
+		const intptr_t field = TransitionFieldOffset( simple, index );
+		if ( field < 0 || field == offset ) {
+			return field < 0 ? -1 : index;
+		}
+	}
+}
+
+// A transition's interpolator is saved by its defining values from payload
+// version 5. Earlier payloads hold raw bytes, and one written before build
+// 1582 has the shorter layout described in SaveGameReleases.h.
+static bool Window_ReadSaveGameTransitionInterpolate( idFile *savefile, idInterpolateAccelDecelLinear<idVec4> &interp ) {
+	if ( OpenQ4_SaveGameRestoreIsPortable( savefile ) ) {
+		windowSaveGameFloats_t saved = { savefile, true };
+		SaveCodec_ReadInterpolate( saved, interp );
+		return saved.ok;
+	}
+	if ( OpenQ4_SaveGameHasInterpolatorCacheFlag( OpenQ4_SaveGameRestoreLayoutBuild( savefile ) ) ) {
+		return OpenQ4_ReadSaveGameRawField( savefile, interp, "idWindow::ReadSaveGameTransition", "interpolate state" );
+	}
+	openQ4SaveGameLegacyInterpolate_t<idVec4> saved;
+	if ( !OpenQ4_ReadSaveGameRawField( savefile, saved, "idWindow::ReadSaveGameTransition", "interpolate state" ) ) {
+		return false;
+	}
+	saved.ToInterpolate( interp );
+	return true;
+}
+
+/*
+===============
+idWindow::ReadSaveGameTransition
+===============
+*/
+bool idWindow::ReadSaveGameTransition( idTransitionData &trans, idFile *savefile ) {
+	int offset = -1;
+	trans.data = NULL;
+
+	if ( !OpenQ4_ReadSaveGameInt( savefile, offset, "idWindow::ReadSaveGameTransition", "offset" ) ) {
+		return false;
+	}
+	if ( offset != -1 ) {
+		if ( offset < 0 ) {
+			common->Error( "idWindow::ReadSaveGameTransition: invalid target offset %d for window '%s' in gui '%s'",
+				offset, name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return false;
+		}
+		idStr winName;
+		if ( !ReadSaveGameString( winName, savefile ) ||
+			 !Window_ReadSaveGameTransitionInterpolate( savefile, trans.interp ) ) {
+			return false;
+		}
+		trans.offset = offset;
+		if ( winName.IsEmpty() ) {
+			common->Error( "idWindow::ReadSaveGameTransition: transition for window '%s' in gui '%s' has an empty target name",
+				name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return false;
+		}
+		idWinStr *strVar = new idWinStr();
+		strVar->Set( winName );
+		trans.data = dynamic_cast< idWinVar* >( strVar );
+	}
+	return true;
+}
+
+static const int SAVEGAME_WINDOW_REFERENCE_NULL = -1;
+static const int SAVEGAME_WINDOW_REFERENCE_DESCENDANT_BASE = -2;
+static const int SAVEGAME_MAX_WINDOW_DESCENDANTS = 1024 * 1024;
+static const int SAVEGAME_MAX_WINDOW_DEPTH = 1024;
+
+int idWindow::SaveGameChildIDCompare( idWindow * const *left, idWindow * const *right ) {
+	if ( ( *left )->childID < ( *right )->childID ) {
+		return -1;
+	}
+	if ( ( *left )->childID > ( *right )->childID ) {
+		return 1;
+	}
+	return 0;
+}
+
+bool idWindow::BuildSaveGameChildOrder( idList<idWindow *> &orderedChildren, const char *operation ) const {
+	orderedChildren.SetNum( children.Num() );
+	for ( int i = 0; i < children.Num(); i++ ) {
+		idWindow *child = children[i];
+		if ( child == NULL ) {
+			common->Error( "%s: window '%s' in gui '%s' has a NULL child at index %d",
+				operation, name.c_str(), gui ? gui->GetSourceFile() : "<null>", i );
+			orderedChildren.Clear();
+			return false;
+		}
+		if ( child->parent != this ) {
+			common->Error( "%s: child '%s' of window '%s' in gui '%s' has an inconsistent parent",
+				operation, child->name.c_str(), name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			orderedChildren.Clear();
+			return false;
+		}
+		if ( child->childID < 0 ) {
+			common->Error( "%s: child '%s' of window '%s' in gui '%s' has invalid id %d",
+				operation, child->name.c_str(), name.c_str(), gui ? gui->GetSourceFile() : "<null>", child->childID );
+			orderedChildren.Clear();
+			return false;
+		}
+		orderedChildren[i] = child;
+	}
+	orderedChildren.Sort( SaveGameChildIDCompare );
+	for ( int i = 1; i < orderedChildren.Num(); i++ ) {
+		if ( orderedChildren[i - 1]->childID == orderedChildren[i]->childID ) {
+			common->Error( "%s: children '%s' and '%s' of window '%s' in gui '%s' have duplicate id %d",
+				operation, orderedChildren[i - 1]->name.c_str(), orderedChildren[i]->name.c_str(), name.c_str(),
+				gui ? gui->GetSourceFile() : "<null>", orderedChildren[i]->childID );
+			orderedChildren.Clear();
+			return false;
+		}
+	}
+	return true;
+}
+
+bool idWindow::FindSaveGameDescendantOrdinal( const idWindow *window, int &nextOrdinal, int &foundOrdinal, int depth ) const {
+	if ( depth > SAVEGAME_MAX_WINDOW_DEPTH ) {
+		common->Error( "idWindow::WriteToSaveGame: gui '%s' exceeds the maximum window nesting depth",
+			gui ? gui->GetSourceFile() : "<null>" );
+		return false;
+	}
+	idList<idWindow *> orderedChildren;
+	if ( !BuildSaveGameChildOrder( orderedChildren, "idWindow::WriteToSaveGame" ) ) {
+		return false;
+	}
+	for ( int i = 0; i < orderedChildren.Num(); i++ ) {
+		if ( nextOrdinal >= SAVEGAME_MAX_WINDOW_DESCENDANTS ) {
+			common->Error( "idWindow::WriteToSaveGame: gui '%s' exceeds the maximum descendant count",
+				gui ? gui->GetSourceFile() : "<null>" );
+			return false;
+		}
+		idWindow *child = orderedChildren[i];
+		const int childOrdinal = nextOrdinal++;
+		if ( child == window ) {
+			foundOrdinal = childOrdinal;
+			return true;
+		}
+		if ( child->FindSaveGameDescendantOrdinal( window, nextOrdinal, foundOrdinal, depth + 1 ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+idWindow *idWindow::FindSaveGameDescendantByOrdinal( int targetOrdinal, int &nextOrdinal, int depth ) {
+	if ( depth > SAVEGAME_MAX_WINDOW_DEPTH ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' exceeds the maximum window nesting depth",
+			gui ? gui->GetSourceFile() : "<null>" );
+		return NULL;
+	}
+	idList<idWindow *> orderedChildren;
+	if ( !BuildSaveGameChildOrder( orderedChildren, "idWindow::ReadFromSaveGame" ) ) {
+		return NULL;
+	}
+	for ( int i = 0; i < orderedChildren.Num(); i++ ) {
+		if ( nextOrdinal >= SAVEGAME_MAX_WINDOW_DESCENDANTS ) {
+			common->Error( "idWindow::ReadFromSaveGame: gui '%s' exceeds the maximum descendant count",
+				gui ? gui->GetSourceFile() : "<null>" );
+			return NULL;
+		}
+		idWindow *child = orderedChildren[i];
+		if ( nextOrdinal++ == targetOrdinal ) {
+			return child;
+		}
+		idWindow *resolved = child->FindSaveGameDescendantByOrdinal( targetOrdinal, nextOrdinal, depth + 1 );
+		if ( resolved != NULL ) {
+			return resolved;
+		}
+	}
+	return NULL;
+}
+
+bool idWindow::FindSaveGameFlaggedDescendants( unsigned int flag, idWindow *&match, int &matches, int &visited, int depth ) {
+	if ( depth > SAVEGAME_MAX_WINDOW_DEPTH ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' exceeds the maximum window nesting depth",
+			gui ? gui->GetSourceFile() : "<null>" );
+		return false;
+	}
+	idList<idWindow *> orderedChildren;
+	if ( !BuildSaveGameChildOrder( orderedChildren, "idWindow::ReadFromSaveGame" ) ) {
+		return false;
+	}
+	for ( int i = 0; i < orderedChildren.Num(); i++ ) {
+		if ( visited++ >= SAVEGAME_MAX_WINDOW_DESCENDANTS ) {
+			common->Error( "idWindow::ReadFromSaveGame: gui '%s' exceeds the maximum descendant count",
+				gui ? gui->GetSourceFile() : "<null>" );
+			return false;
+		}
+		idWindow *child = orderedChildren[i];
+		if ( ( child->flags & flag ) != 0 ) {
+			match = child;
+			matches++;
+		}
+		if ( !child->FindSaveGameFlaggedDescendants( flag, match, matches, visited, depth + 1 ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool idWindow::ValidateRestoredTrackedWindowPointers( bool hadSavedFocusReference, bool hadSavedCaptureReference ) {
+	if ( ( flags & WIN_DESKTOP ) == 0 ) {
+		return true;
+	}
+
+	idWindow *flaggedFocus = NULL;
+	int focusMatches = 0;
+	int visited = 0;
+	if ( !FindSaveGameFlaggedDescendants( WIN_FOCUS, flaggedFocus, focusMatches, visited, 0 ) ) {
+		return false;
+	}
+	if ( focusMatches > 1 ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' restored %d focused windows",
+			gui ? gui->GetSourceFile() : "<null>", focusMatches );
+		return false;
+	}
+	if ( focusMatches == 1 ) {
+		// Legacy v2 saves could serialize a nested window using only its parent-local
+		// child id. The focus flag identifies the intended descendant unambiguously.
+		focusedChild = flaggedFocus;
+	} else if ( hadSavedFocusReference || focusedChild != NULL ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' restored a focused child reference without a focused window",
+			gui ? gui->GetSourceFile() : "<null>" );
+		return false;
+	}
+
+	idWindow *flaggedCapture = NULL;
+	int captureMatches = 0;
+	visited = 0;
+	if ( !FindSaveGameFlaggedDescendants( WIN_CAPTURE, flaggedCapture, captureMatches, visited, 0 ) ) {
+		return false;
+	}
+	if ( captureMatches > 1 ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' restored %d captured windows",
+			gui ? gui->GetSourceFile() : "<null>", captureMatches );
+		return false;
+	}
+	if ( captureMatches == 1 ) {
+		captureChild = flaggedCapture;
+	} else if ( hadSavedCaptureReference || captureChild != NULL ) {
+		common->Error( "idWindow::ReadFromSaveGame: gui '%s' restored a capture child reference without a captured window",
+			gui ? gui->GetSourceFile() : "<null>" );
+		return false;
+	}
+	return true;
+}
+
+bool idWindow::WriteSaveGameChildReference( idWindow *child, idFile *savefile, const char *fieldName, bool allowDescendant ) {
+	if ( savefile == NULL ) {
+		common->Error( "idWindow::WriteToSaveGame: invalid output file while writing %s for window '%s'",
+			fieldName ? fieldName : "child reference", name.c_str() );
+		return false;
+	}
+	int childId = -1;
+	if ( child != NULL ) {
+		idList<idWindow *> orderedChildren;
+		if ( !BuildSaveGameChildOrder( orderedChildren, "idWindow::WriteToSaveGame" ) ) {
+			return false;
+		}
+		bool isDirectChild = false;
+		for ( int i = 0; i < orderedChildren.Num(); i++ ) {
+			if ( orderedChildren[i] == child ) {
+				isDirectChild = true;
+				break;
+			}
+		}
+		if ( isDirectChild ) {
+			childId = child->childID;
+		} else if ( allowDescendant ) {
+			int nextOrdinal = 0;
+			int foundOrdinal = -1;
+			if ( !FindSaveGameDescendantOrdinal( child, nextOrdinal, foundOrdinal, 0 ) ) {
+				common->Error( "idWindow::WriteToSaveGame: %s for window '%s' in gui '%s' is not a descendant",
+					fieldName ? fieldName : "child reference", name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+				return false;
+			}
+			childId = SAVEGAME_WINDOW_REFERENCE_DESCENDANT_BASE - foundOrdinal;
+		} else {
+			common->Error( "idWindow::WriteToSaveGame: %s for window '%s' in gui '%s' is not a valid direct child",
+				fieldName ? fieldName : "child reference", name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return false;
+		}
+	}
+	return OpenQ4_WriteSaveGameInt( savefile, childId, "idWindow::WriteToSaveGame",
+		fieldName ? fieldName : "child reference" );
+}
+
+idWindow *idWindow::ReadSaveGameChildReference( idFile *savefile, const char *fieldName, bool allowDescendant,
+		bool *hadSerializedReference, bool *readSucceeded ) {
+	int savedChildId = -1;
+	if ( readSucceeded != NULL ) {
+		*readSucceeded = false;
+	}
+	if ( hadSerializedReference != NULL ) {
+		*hadSerializedReference = false;
+	}
+	if ( !OpenQ4_ReadSaveGameInt( savefile, savedChildId, "idWindow::ReadFromSaveGame",
+			fieldName ? fieldName : "child reference" ) ) {
+		return NULL;
+	}
+	if ( hadSerializedReference != NULL ) {
+		*hadSerializedReference = savedChildId != SAVEGAME_WINDOW_REFERENCE_NULL;
+	}
+	if ( savedChildId == SAVEGAME_WINDOW_REFERENCE_NULL ) {
+		if ( readSucceeded != NULL ) {
+			*readSucceeded = true;
+		}
+		return NULL;
+	}
+	if ( savedChildId < 0 ) {
+		if ( !allowDescendant || savedChildId > SAVEGAME_WINDOW_REFERENCE_DESCENDANT_BASE ) {
+			common->Error( "idWindow::ReadFromSaveGame: invalid %s %d for window '%s' in gui '%s'",
+				fieldName ? fieldName : "child reference", savedChildId, name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return NULL;
+		}
+		const int64 targetOrdinal64 = static_cast<int64>( SAVEGAME_WINDOW_REFERENCE_DESCENDANT_BASE ) - static_cast<int64>( savedChildId );
+		if ( targetOrdinal64 < 0 || targetOrdinal64 >= SAVEGAME_MAX_WINDOW_DESCENDANTS ) {
+			common->Error( "idWindow::ReadFromSaveGame: invalid descendant ordinal %lld for %s in window '%s' in gui '%s'",
+				static_cast<long long>( targetOrdinal64 ), fieldName ? fieldName : "child reference", name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return NULL;
+		}
+		const int targetOrdinal = static_cast<int>( targetOrdinal64 );
+		int nextOrdinal = 0;
+		idWindow *resolved = FindSaveGameDescendantByOrdinal( targetOrdinal, nextOrdinal, 0 );
+		if ( resolved == NULL ) {
+			common->Error( "idWindow::ReadFromSaveGame: descendant ordinal %d for %s in window '%s' in gui '%s' could not be resolved",
+				targetOrdinal, fieldName ? fieldName : "child reference", name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+			return NULL;
+		}
+		if ( readSucceeded != NULL ) {
+			*readSucceeded = true;
+		}
+		return resolved;
+	}
+
+	idList<idWindow *> orderedChildren;
+	if ( !BuildSaveGameChildOrder( orderedChildren, "idWindow::ReadFromSaveGame" ) ) {
+		return NULL;
+	}
+	for ( int i = 0; i < orderedChildren.Num(); i++ ) {
+		if ( orderedChildren[i]->childID == savedChildId ) {
+			if ( readSucceeded != NULL ) {
+				*readSucceeded = true;
+			}
+			return orderedChildren[i];
+		}
+	}
+	if ( allowDescendant ) {
+		// Legacy v2 wrote a nested desktop focus/capture target as its parent-local
+		// positive child id. It cannot be resolved here, but its restored flag can
+		// identify the intended descendant after the complete window tree is read.
+		if ( readSucceeded != NULL ) {
+			*readSucceeded = true;
+		}
+		return NULL;
+	}
+	common->Error( "idWindow::ReadFromSaveGame: %s %d for window '%s' in gui '%s' does not match a direct child",
+		fieldName ? fieldName : "child reference", savedChildId, name.c_str(), gui ? gui->GetSourceFile() : "<null>" );
+	return NULL;
+}
+
+/*
+===============
+idWindow::WriteToSaveGame
+===============
+*/
+void idWindow::WriteToSaveGame( idFile *savefile ) {
+	int i;
+	if ( savefile == NULL || gui == NULL ) {
+		common->Error( "idWindow::WriteToSaveGame: invalid save context for window '%s'", name.c_str() );
+		return;
+	}
+
+	const float savedTextStyleValue = textstyle;
+	const float savedTextSpacing = textspacing;
+	if ( !std::isfinite( actualX ) || !std::isfinite( actualY ) ||
+		 !OpenQ4_IsFiniteSaveGameRectangle( drawRect ) || !OpenQ4_IsFiniteSaveGameRectangle( clientRect ) ||
+		 !OpenQ4_IsFiniteSaveGameRectangle( textRect ) || !OpenQ4_IsFiniteSaveGameVec2( origin ) ||
+		 !std::isfinite( xOffset ) || !std::isfinite( yOffset ) ||
+		 !std::isfinite( forceAspectWidth ) || !std::isfinite( forceAspectHeight ) ||
+		 !std::isfinite( matScalex ) || !std::isfinite( matScaley ) || !std::isfinite( borderSize ) ||
+		 !std::isfinite( textAlignx ) || !std::isfinite( textAligny ) ||
+		 !std::isfinite( savedTextStyleValue ) || savedTextStyleValue < -128.0f || savedTextStyleValue > 127.0f ||
+		 !std::isfinite( savedTextSpacing ) || !OpenQ4_IsFiniteSaveGameVec2( shear ) ) {
+		common->Error( "idWindow::WriteToSaveGame: refusing non-finite or out-of-range layout state for window '%s' in gui '%s'",
+			name.c_str(), gui->GetSourceFile() );
+		return;
+	}
+
+	if ( !WriteSaveGameString( cmd, savefile ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, actualX, "idWindow::WriteToSaveGame", "actualX" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, actualY, "idWindow::WriteToSaveGame", "actualY" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, childID, "idWindow::WriteToSaveGame", "childID" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, flags, "idWindow::WriteToSaveGame", "flags" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, lastTimeRun, "idWindow::WriteToSaveGame", "last time run" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, drawRect, "idWindow::WriteToSaveGame", "draw rect" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, clientRect, "idWindow::WriteToSaveGame", "client rect" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, origin, "idWindow::WriteToSaveGame", "origin" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, fontNum, "idWindow::WriteToSaveGame", "font number" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, timeLine, "idWindow::WriteToSaveGame", "timeline" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, xOffset, "idWindow::WriteToSaveGame", "x offset" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, yOffset, "idWindow::WriteToSaveGame", "y offset" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, cursor, "idWindow::WriteToSaveGame", "cursor" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, forceAspectWidth, "idWindow::WriteToSaveGame", "force aspect width" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, forceAspectHeight, "idWindow::WriteToSaveGame", "force aspect height" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, matScalex, "idWindow::WriteToSaveGame", "material scale x" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, matScaley, "idWindow::WriteToSaveGame", "material scale y" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, borderSize, "idWindow::WriteToSaveGame", "border size" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, textAlign, "idWindow::WriteToSaveGame", "text align" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, textAlignx, "idWindow::WriteToSaveGame", "text align x" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, textAligny, "idWindow::WriteToSaveGame", "text align y" ) ) {
+		return;
+	}
+	const signed char savedTextStyle = static_cast<signed char>( static_cast<int>( textstyle ) );
+	if ( !OpenQ4_WriteSaveGameField( savefile, savedTextStyle, "idWindow::WriteToSaveGame", "text style" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, savedTextSpacing, "idWindow::WriteToSaveGame", "text spacing" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, textShadow, "idWindow::WriteToSaveGame", "text shadow" ) ||
+		 !OpenQ4_WriteSaveGameField( savefile, shear, "idWindow::WriteToSaveGame", "shear" ) ) {
+		return;
+	}
+
+	if ( !WriteSaveGameString( name, savefile ) || !WriteSaveGameString( comment, savefile ) ) {
+		return;
+	}
+
+	// WinVars
+	OpenQ4_SanitizeSaveGameWinVar( noTime, "idWindow::WriteToSaveGame", name.c_str(), "noTime" );
+	OpenQ4_SanitizeSaveGameWinVar( visible, "idWindow::WriteToSaveGame", name.c_str(), "visible" );
+	OpenQ4_SanitizeSaveGameWinVar( rect, "idWindow::WriteToSaveGame", name.c_str(), "rect" );
+	OpenQ4_SanitizeSaveGameWinVar( backColor, "idWindow::WriteToSaveGame", name.c_str(), "backColor" );
+	OpenQ4_SanitizeSaveGameWinVar( matColor, "idWindow::WriteToSaveGame", name.c_str(), "matColor" );
+	OpenQ4_SanitizeSaveGameWinVar( foreColor, "idWindow::WriteToSaveGame", name.c_str(), "foreColor" );
+	OpenQ4_SanitizeSaveGameWinVar( hoverColor, "idWindow::WriteToSaveGame", name.c_str(), "hoverColor" );
+	OpenQ4_SanitizeSaveGameWinVar( borderColor, "idWindow::WriteToSaveGame", name.c_str(), "borderColor" );
+	OpenQ4_SanitizeSaveGameWinVar( textScale, "idWindow::WriteToSaveGame", name.c_str(), "textScale" );
+	OpenQ4_SanitizeSaveGameWinVar( noEvents, "idWindow::WriteToSaveGame", name.c_str(), "noEvents" );
+	OpenQ4_SanitizeSaveGameWinVar( rotate, "idWindow::WriteToSaveGame", name.c_str(), "rotate" );
+	noTime.WriteToSaveGame( savefile );
+	visible.WriteToSaveGame( savefile );
+	rect.WriteToSaveGame( savefile );
+	backColor.WriteToSaveGame( savefile );
+	matColor.WriteToSaveGame( savefile );
+	foreColor.WriteToSaveGame( savefile );
+	hoverColor.WriteToSaveGame( savefile );
+	borderColor.WriteToSaveGame( savefile );
+	textScale.WriteToSaveGame( savefile );
+	noEvents.WriteToSaveGame( savefile );
+	rotate.WriteToSaveGame( savefile );
+	text.WriteToSaveGame( savefile );
+	backGroundName.WriteToSaveGame( savefile );
+	hideCursor.WriteToSaveGame(savefile);
+
+	// Defined Vars
+	for ( i = 0; i < definedVars.Num(); i++ ) {
+		if ( definedVars[i] == NULL ) {
+			common->Error( "idWindow::WriteToSaveGame: NULL defined variable %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		OpenQ4_SanitizeSaveGameWinVar( *definedVars[i], "idWindow::WriteToSaveGame", name.c_str(),
+			definedVars[i]->GetName() );
+		definedVars[i]->WriteToSaveGame( savefile );
+	}
+
+	if ( !OpenQ4_WriteSaveGameField( savefile, textRect, "idWindow::WriteToSaveGame", "text rect" ) ) {
+		return;
+	}
+
+	// Window pointers saved as the child ID of the window
+	const bool desktopTrackedDescendants = ( flags & WIN_DESKTOP ) != 0;
+	if ( !WriteSaveGameChildReference( focusedChild, savefile, "focused child id", desktopTrackedDescendants ) ||
+		 !WriteSaveGameChildReference( captureChild, savefile, "capture child id", desktopTrackedDescendants ) ||
+		 !WriteSaveGameChildReference( overChild, savefile, "hovered child id", false ) ) {
+		return;
+	}
+
+
+	// The scripts and events below have no back-pointer to this window, so a
+	// diagnostic raised inside one could not say where it came from. Name it here.
+	const idStr scriptContext = idStr( "window '" ) + name.c_str() + "' in gui '" +
+		( gui != NULL ? gui->GetSourceFile() : "<none>" ) + "'";
+
+	// Scripts
+	for ( i = 0; i < SCRIPT_COUNT; i++ ) {
+		if ( scripts[i] ) {
+			scripts[i]->WriteToSaveGame( savefile, scriptContext.c_str() );
+		}
+	}
+
+	// TimeLine Events
+	for ( i = 0; i < timeLineEvents.Num(); i++ ) {
+		if ( timeLineEvents[i] == NULL || timeLineEvents[i]->event == NULL ) {
+			common->Error( "idWindow::WriteToSaveGame: incomplete timeline event %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		if ( !OpenQ4_WriteSaveGameBool( savefile, timeLineEvents[i]->pending, "idWindow::WriteToSaveGame", "timeline pending flag" ) ||
+			 !OpenQ4_WriteSaveGameInt( savefile, timeLineEvents[i]->time, "idWindow::WriteToSaveGame", "timeline event time" ) ) {
+			return;
+		}
+		timeLineEvents[i]->event->WriteToSaveGame( savefile, scriptContext.c_str() );
+	}
+
+	// Transitions
+	int num = transitions.Num();
+
+	if ( !OpenQ4_WriteSaveGameInt( savefile, num, "idWindow::WriteToSaveGame", "transition count" ) ) {
+		return;
+	}
+	for ( i = 0; i < transitions.Num(); i++ ) {
+		if ( !WriteSaveGameTransition( transitions[ i ], savefile ) ) {
+			return;
+		}
+	}
+
+
+	// Named Events
+	for ( i = 0; i < namedEvents.Num(); i++ ) {
+		if ( namedEvents[i] == NULL || namedEvents[i]->mEvent == NULL || namedEvents[i]->mName.IsEmpty() ) {
+			common->Error( "idWindow::WriteToSaveGame: incomplete named event %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		if ( !WriteSaveGameString( namedEvents[i]->mName, savefile ) ) {
+			return;
+		}
+		namedEvents[i]->mEvent->WriteToSaveGame( savefile, scriptContext.c_str() );
+	}
+
+	// regList
+	regList.WriteToSaveGame( savefile );
+
+
+	// Save children
+	for ( i = 0; i < drawWindows.Num(); i++ ) {
+		drawWin_t	window = drawWindows[i];
+		if ( ( window.simp == NULL ) == ( window.win == NULL ) ) {
+			common->Error( "idWindow::WriteToSaveGame: draw window %d for '%s' in gui '%s' has invalid simple/full ownership",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		if ( window.simp != NULL ) {
+			window.simp->WriteToSaveGame( savefile );
+		} else {
+			window.win->WriteToSaveGame( savefile );
+		}
+	}
+}
+
+/*
+===============
+idWindow::ReadSaveGameString
+===============
+*/
+bool idWindow::ReadSaveGameString( idStr &string, idFile *savefile ) {
+	string.Clear();
+	if ( savefile == NULL ) {
+		common->Error( "idWindow::ReadSaveGameString: invalid input file for window '%s'", name.c_str() );
+		return false;
+	}
+	int len = 0;
+	const int offset = savefile->Tell();
+
+	if ( !OpenQ4_ReadSaveGameInt( savefile, len, "idWindow::ReadSaveGameString", "length" ) ) {
+		return false;
+	}
+	const int remainingBytes = Max( 0, savefile->Length() - savefile->Tell() );
+	const int maxSavedStringLength = 64 * 1024;
+	if ( len < 0 || len > maxSavedStringLength || len > remainingBytes ) {
+		common->Error( "idWindow::ReadSaveGameString: invalid length %d at offset %d (remaining %d)",
+			len, offset, remainingBytes );
+		return false;
+	}
+
+	string.Fill( ' ', len );
+	if ( len > 0 ) {
+		if ( !OpenQ4_ReadSaveGameBytes( savefile, &string[0], len, "idWindow::ReadSaveGameString", "string" ) ) {
+			string.Clear();
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+===============
+idWindow::ReadFromSaveGame
+===============
+*/
+void idWindow::ReadFromSaveGame( idFile *savefile ) {
+	int i;
+	if ( savefile == NULL || gui == NULL ) {
+		common->Error( "idWindow::ReadFromSaveGame: invalid restore context for parsed window '%s'", name.c_str() );
+		return;
+	}
+
+	transitions.Clear();
+
+	idStr savedCmd;
+	float savedActualX;
+	float savedActualY;
+	int savedChildID = -1;
+	unsigned int savedFlags = 0;
+	int savedLastTimeRun;
+	idRectangle savedDrawRect;
+	idRectangle savedClientRect;
+	idVec2 savedOrigin;
+	unsigned char savedFontNum;
+	int savedTimeLine;
+	float savedXOffset;
+	float savedYOffset;
+	unsigned char savedCursor;
+	float savedForceAspectWidth;
+	float savedForceAspectHeight;
+	float savedMatScaleX;
+	float savedMatScaleY;
+	float savedBorderSize;
+	signed char savedTextAlign;
+	float savedTextAlignX;
+	float savedTextAlignY;
+	signed char savedTextStyle = 0;
+	float savedTextSpacing = 0.0f;
+	signed char savedTextShadow;
+	idVec2 savedShear;
+
+	if ( !ReadSaveGameString( savedCmd, savefile ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedActualX, "idWindow::ReadFromSaveGame", "actualX" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedActualY, "idWindow::ReadFromSaveGame", "actualY" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedChildID, "idWindow::ReadFromSaveGame", "childID" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedFlags, "idWindow::ReadFromSaveGame", "flags" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedLastTimeRun, "idWindow::ReadFromSaveGame", "last time run" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedDrawRect, "idWindow::ReadFromSaveGame", "draw rect" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedClientRect, "idWindow::ReadFromSaveGame", "client rect" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedOrigin, "idWindow::ReadFromSaveGame", "origin" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedFontNum, "idWindow::ReadFromSaveGame", "font number" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTimeLine, "idWindow::ReadFromSaveGame", "timeline" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedXOffset, "idWindow::ReadFromSaveGame", "x offset" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedYOffset, "idWindow::ReadFromSaveGame", "y offset" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedCursor, "idWindow::ReadFromSaveGame", "cursor" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedForceAspectWidth, "idWindow::ReadFromSaveGame", "force aspect width" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedForceAspectHeight, "idWindow::ReadFromSaveGame", "force aspect height" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedMatScaleX, "idWindow::ReadFromSaveGame", "material scale x" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedMatScaleY, "idWindow::ReadFromSaveGame", "material scale y" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedBorderSize, "idWindow::ReadFromSaveGame", "border size" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextAlign, "idWindow::ReadFromSaveGame", "text align" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextAlignX, "idWindow::ReadFromSaveGame", "text align x" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextAlignY, "idWindow::ReadFromSaveGame", "text align y" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextStyle, "idWindow::ReadFromSaveGame", "text style" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextSpacing, "idWindow::ReadFromSaveGame", "text spacing" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedTextShadow, "idWindow::ReadFromSaveGame", "text shadow" ) ||
+		 !OpenQ4_ReadSaveGameField( savefile, savedShear, "idWindow::ReadFromSaveGame", "shear" ) ) {
+		return;
+	}
+
+	idStr savedName;
+	idStr savedComment;
+	if ( !ReadSaveGameString( savedName, savefile ) || !ReadSaveGameString( savedComment, savefile ) ) {
+		return;
+	}
+	if ( !std::isfinite( savedActualX ) || !std::isfinite( savedActualY ) ||
+		 !OpenQ4_IsFiniteSaveGameRectangle( savedDrawRect ) || !OpenQ4_IsFiniteSaveGameRectangle( savedClientRect ) ||
+		 !OpenQ4_IsFiniteSaveGameVec2( savedOrigin ) || !std::isfinite( savedXOffset ) || !std::isfinite( savedYOffset ) ||
+		 !std::isfinite( savedForceAspectWidth ) || !std::isfinite( savedForceAspectHeight ) ||
+		 !std::isfinite( savedMatScaleX ) || !std::isfinite( savedMatScaleY ) || !std::isfinite( savedBorderSize ) ||
+		 !std::isfinite( savedTextAlignX ) || !std::isfinite( savedTextAlignY ) ||
+		 !std::isfinite( savedTextSpacing ) || !OpenQ4_IsFiniteSaveGameVec2( savedShear ) ) {
+		common->Error( "idWindow::ReadFromSaveGame: non-finite layout state for saved window '%s' in gui '%s'",
+			savedName.c_str(), gui->GetSourceFile() );
+		return;
+	}
+	if ( savedChildID != childID ) {
+		common->Error( "idWindow::ReadFromSaveGame: saved child id %d for window '%s' does not match parsed window '%s' (id %d, parent '%s') in gui '%s'",
+			savedChildID, savedName.c_str(), name.c_str(), childID,
+			parent ? parent->name.c_str() : "<root>", gui->GetSourceFile() );
+		return;
+	}
+	const unsigned int structuralFlagMask = WIN_CHILD | WIN_DESKTOP;
+	if ( ( savedFlags & structuralFlagMask ) != ( flags & structuralFlagMask ) ) {
+		common->Error( "idWindow::ReadFromSaveGame: saved structural flags 0x%08x for window '%s' do not match parsed flags 0x%08x in gui '%s'",
+			savedFlags & structuralFlagMask, savedName.c_str(), flags & structuralFlagMask, gui->GetSourceFile() );
+		return;
+	}
+	if ( savedName.Icmp( name ) != 0 ) {
+		common->Error( "idWindow::ReadFromSaveGame: saved window '%s' does not match parsed window '%s' in gui '%s'",
+			savedName.c_str(), name.c_str(), gui->GetSourceFile() );
+		return;
+	}
+	cmd = savedCmd;
+	actualX = savedActualX;
+	actualY = savedActualY;
+	lastTimeRun = savedLastTimeRun;
+	drawRect = savedDrawRect;
+	clientRect = savedClientRect;
+	origin = savedOrigin;
+	fontNum = savedFontNum;
+	timeLine = savedTimeLine;
+	xOffset = savedXOffset;
+	yOffset = savedYOffset;
+	cursor = savedCursor;
+	forceAspectWidth = savedForceAspectWidth;
+	forceAspectHeight = savedForceAspectHeight;
+	matScalex = savedMatScaleX;
+	matScaley = savedMatScaleY;
+	borderSize = savedBorderSize;
+	textAlign = savedTextAlign;
+	textAlignx = savedTextAlignX;
+	textAligny = savedTextAlignY;
+	textstyle = static_cast<float>( savedTextStyle );
+	textspacing = savedTextSpacing;
+	textShadow = savedTextShadow;
+	shear = savedShear;
+	flags = savedFlags;
+	comment = savedComment;
+
+	// WinVars
+	noTime.ReadFromSaveGame( savefile );
+	visible.ReadFromSaveGame( savefile );
+	rect.ReadFromSaveGame( savefile );
+	backColor.ReadFromSaveGame( savefile );
+	matColor.ReadFromSaveGame( savefile );
+	foreColor.ReadFromSaveGame( savefile );
+	hoverColor.ReadFromSaveGame( savefile );
+	borderColor.ReadFromSaveGame( savefile );
+	textScale.ReadFromSaveGame( savefile );
+	noEvents.ReadFromSaveGame( savefile );
+	rotate.ReadFromSaveGame( savefile );
+	text.ReadFromSaveGame( savefile );
+	backGroundName.ReadFromSaveGame( savefile );
+	// Quake 4 GUI save streams serialize hideCursor unconditionally.
+	// Skipping this read desynchronizes the restore stream and eventually crashes object restore.
+	hideCursor.ReadFromSaveGame( savefile );
+
+	// Defined Vars
+	for ( i = 0; i < definedVars.Num(); i++ ) {
+		if ( definedVars[i] == NULL ) {
+			common->Error( "idWindow::ReadFromSaveGame: NULL parsed defined variable %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		definedVars[i]->ReadFromSaveGame( savefile );
+	}
+
+	idRectangle savedTextRect;
+	if ( !OpenQ4_ReadSaveGameField( savefile, savedTextRect, "idWindow::ReadFromSaveGame", "text rect" ) ) {
+		return;
+	}
+	if ( !OpenQ4_IsFiniteSaveGameRectangle( savedTextRect ) ) {
+		common->Error( "idWindow::ReadFromSaveGame: non-finite text rectangle for window '%s' in gui '%s'",
+			name.c_str(), gui->GetSourceFile() );
+		return;
+	}
+	textRect = savedTextRect;
+
+	// Window pointers saved as the child ID of the window
+	const bool desktopTrackedDescendants = ( flags & WIN_DESKTOP ) != 0;
+	bool hadSavedFocusReference = false;
+	bool hadSavedCaptureReference = false;
+	bool focusReadSucceeded = false;
+	bool captureReadSucceeded = false;
+	bool overReadSucceeded = false;
+	focusedChild = ReadSaveGameChildReference( savefile, "focused child id", desktopTrackedDescendants,
+		&hadSavedFocusReference, &focusReadSucceeded );
+	captureChild = ReadSaveGameChildReference( savefile, "capture child id", desktopTrackedDescendants,
+		&hadSavedCaptureReference, &captureReadSucceeded );
+	overChild = ReadSaveGameChildReference( savefile, "hovered child id", false, NULL, &overReadSucceeded );
+	if ( !focusReadSucceeded || !captureReadSucceeded || !overReadSucceeded ) {
+		return;
+	}
+	
+	// Scripts
+	for ( i = 0; i < SCRIPT_COUNT; i++ ) {
+		if ( scripts[i] ) {
+			scripts[i]->ReadFromSaveGame( savefile );
+		}
+	}
+
+	// TimeLine Events
+	for ( i = 0; i < timeLineEvents.Num(); i++ ) {
+		if ( timeLineEvents[i] == NULL || timeLineEvents[i]->event == NULL ) {
+			common->Error( "idWindow::ReadFromSaveGame: incomplete parsed timeline event %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		if ( !OpenQ4_ReadSaveGameBool( savefile, timeLineEvents[i]->pending, "idWindow::ReadFromSaveGame", "timeline pending flag" ) ||
+			 !OpenQ4_ReadSaveGameInt( savefile, timeLineEvents[i]->time, "idWindow::ReadFromSaveGame", "timeline event time" ) ) {
+			return;
+		}
+		timeLineEvents[i]->event->ReadFromSaveGame( savefile );
+	}
+
+
+	// Transitions
+	int num = 0;
+	if ( !OpenQ4_ReadSaveGameInt( savefile, num, "idWindow::ReadFromSaveGame", "transition count" ) ) {
+		return;
+	}
+	if ( num < 0 || num > 4096 ) {
+		common->Error( "idWindow::ReadFromSaveGame: invalid transition count %d for window '%s'", num, name.c_str() );
+		return;
+	}
+	for ( i = 0; i < num; i++ ) {
+		idTransitionData trans;
+		trans.data = NULL;
+		if ( !ReadSaveGameTransition( trans, savefile ) ) {
+			return;
+		}
+		if ( trans.data ) {
+			transitions.Append( trans );
+		}
+	}
+
+
+	// Named Events
+	for ( i = 0; i < namedEvents.Num(); i++ ) {
+		if ( namedEvents[i] == NULL || namedEvents[i]->mEvent == NULL ) {
+			common->Error( "idWindow::ReadFromSaveGame: incomplete parsed named event %d for window '%s' in gui '%s'",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+
+		idStr savedEventName;
+		if ( !ReadSaveGameString( savedEventName, savefile ) ) {
+			return;
+		}
+
+		int matchedIndex = -1;
+		for ( int j = i; j < namedEvents.Num(); j++ ) {
+			if ( namedEvents[j] != NULL && namedEvents[j]->mName.Icmp( savedEventName ) == 0 ) {
+				matchedIndex = j;
+				break;
+			}
+		}
+
+		if ( matchedIndex == -1 ) {
+			rvNamedEvent *legacyEvent = openQ4_CreateLegacyCinematicNamedEvent( this, savedEventName );
+			if ( legacyEvent != NULL ) {
+				namedEvents.Insert( legacyEvent, i );
+				matchedIndex = i;
+			}
+		}
+
+		if ( matchedIndex == -1 ) {
+			common->Error( "idWindow::ReadFromSaveGame: saved named event '%s' is missing from parsed window '%s' in gui '%s'; restore cannot continue without desynchronizing the stream",
+				savedEventName.c_str(), name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+
+		if ( matchedIndex != i ) {
+			rvNamedEvent *swap = namedEvents[i];
+			namedEvents[i] = namedEvents[matchedIndex];
+			namedEvents[matchedIndex] = swap;
+		}
+
+		if ( namedEvents[i] == NULL || namedEvents[i]->mEvent == NULL ) {
+			common->Error( "idWindow::ReadFromSaveGame: named event '%s' for window '%s' in gui '%s' has no script payload target",
+				savedEventName.c_str(), name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		namedEvents[i]->mEvent->ReadFromSaveGame( savefile );
+	}
+
+	// regList
+	regList.ReadFromSaveGame( savefile );
+
+	// Read children
+	for ( i = 0; i < drawWindows.Num(); i++ ) {
+		drawWin_t	window = drawWindows[i];
+		if ( ( window.simp == NULL ) == ( window.win == NULL ) ) {
+			common->Error( "idWindow::ReadFromSaveGame: draw window %d for '%s' in gui '%s' has invalid simple/full ownership",
+				i, name.c_str(), gui->GetSourceFile() );
+			return;
+		}
+		if ( window.simp != NULL ) {
+			window.simp->ReadFromSaveGame( savefile );
+		} else {
+			window.win->ReadFromSaveGame( savefile );
+		}
+	}
+
+	if ( flags & WIN_DESKTOP ) {
+		if ( !ValidateRestoredTrackedWindowPointers( hadSavedFocusReference, hadSavedCaptureReference ) ) {
+			return;
+		}
+		if ( !FixupTransitions( OpenQ4_SaveGameRestoreIsPortable( savefile ) ) ) {
+			return;
+		}
+	}
+}
+
+/*
+===============
+idWindow::NumTransitions
+===============
+*/
+int idWindow::NumTransitions() {
+	int c = transitions.Num();
+	for ( int i = 0; i < children.Num(); i++ ) {
+		c += children[i]->NumTransitions();
+	}
+	return c;
+}
+
+
+/*
+===============
+idWindow::FixupTransitions
+
+Each saved target is a field index (TransitionFieldOffset) when fieldIndexes is
+set, and a byte offset from an earlier payload otherwise.
+===============
+*/
+bool idWindow::FixupTransitions( bool fieldIndexes ) {
+	if ( gui == NULL || gui->GetDesktop() == NULL ) {
+		common->Error( "idWindow::FixupTransitions: window '%s' has no gui desktop during savegame restore", name.c_str() );
+		return false;
+	}
+	int i, c = transitions.Num();
+	for ( i = 0; i < c; i++ ) {
+		if ( transitions[i].data == NULL ) {
+			common->Error( "idWindow::FixupTransitions: transition %d for window '%s' in gui '%s' has no saved target",
+				i, name.c_str(), gui->GetSourceFile() );
+			return false;
+		}
+		const idStr transitionTarget = static_cast<idWinStr *>( transitions[i].data )->c_str();
+		drawWin_t *dw = gui->GetDesktop()->FindChildByName( transitionTarget );
+		delete transitions[i].data;
+		transitions[i].data = NULL;
+		if ( dw != NULL && ( ( dw->win == NULL ) == ( dw->simp == NULL ) ) ) {
+			common->Error( "idWindow::FixupTransitions: target '%s' for window '%s' in gui '%s' has invalid simple/full ownership",
+				transitionTarget.c_str(), name.c_str(), gui->GetSourceFile() );
+			return false;
+		}
+		if ( dw && ( dw->win || dw->simp ) ){
+			const intptr_t transitionOffset = fieldIndexes ?
+				TransitionFieldOffset( dw->simp != NULL, transitions[i].offset ) : (intptr_t)transitions[i].offset;
+			if ( dw->win ) {
+				if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->rect ) {
+					transitions[i].data = &dw->win->rect;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->backColor ) {
+					transitions[i].data = &dw->win->backColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->backColor_r ) {
+					transitions[i].data = &dw->win->backColor_r;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->backColor_g ) {
+					transitions[i].data = &dw->win->backColor_g;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->backColor_b ) {
+					transitions[i].data = &dw->win->backColor_b;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->backColor_w ) {
+					transitions[i].data = &dw->win->backColor_w;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->matColor ) {
+					transitions[i].data = &dw->win->matColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->matColor_r ) {
+					transitions[i].data = &dw->win->matColor_r;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->matColor_g ) {
+					transitions[i].data = &dw->win->matColor_g;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->matColor_b ) {
+					transitions[i].data = &dw->win->matColor_b;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->matColor_w ) {
+					transitions[i].data = &dw->win->matColor_w;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->foreColor ) {
+					transitions[i].data = &dw->win->foreColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->foreColor_r ) {
+					transitions[i].data = &dw->win->foreColor_r;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->foreColor_g ) {
+					transitions[i].data = &dw->win->foreColor_g;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->foreColor_b ) {
+					transitions[i].data = &dw->win->foreColor_b;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->foreColor_w ) {
+					transitions[i].data = &dw->win->foreColor_w;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->hoverColor ) {
+					transitions[i].data = &dw->win->hoverColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->hoverColor_r ) {
+					transitions[i].data = &dw->win->hoverColor_r;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->hoverColor_g ) {
+					transitions[i].data = &dw->win->hoverColor_g;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->hoverColor_b ) {
+					transitions[i].data = &dw->win->hoverColor_b;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->hoverColor_w ) {
+					transitions[i].data = &dw->win->hoverColor_w;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->borderColor ) {
+					transitions[i].data = &dw->win->borderColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->borderColor_r ) {
+					transitions[i].data = &dw->win->borderColor_r;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->borderColor_g ) {
+					transitions[i].data = &dw->win->borderColor_g;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->borderColor_b ) {
+					transitions[i].data = &dw->win->borderColor_b;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->borderColor_w ) {
+					transitions[i].data = &dw->win->borderColor_w;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->textScale ) {
+					transitions[i].data = &dw->win->textScale;
+				} else if ( transitionOffset == (intptr_t)&( ( idWindow * ) 0 )->rotate ) {
+					transitions[i].data = &dw->win->rotate;
+				}
+			} else {
+				if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->rect ) {
+					transitions[i].data = &dw->simp->rect;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->backColor ) {
+					transitions[i].data = &dw->simp->backColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->matColor ) {
+					transitions[i].data = &dw->simp->matColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->foreColor ) {
+					transitions[i].data = &dw->simp->foreColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->borderColor ) {
+					transitions[i].data = &dw->simp->borderColor;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->textScale ) {
+					transitions[i].data = &dw->simp->textScale;
+				} else if ( transitionOffset == (intptr_t)&( ( idSimpleWindow * ) 0 )->rotate ) {
+					transitions[i].data = &dw->simp->rotate;
+				}
+			}
+		}
+		if ( transitions[i].data == NULL ) {
+			common->Error( "idWindow::FixupTransitions: could not resolve saved transition target '%s' offset %d for window '%s' in gui '%s'",
+				transitionTarget.c_str(), transitions[i].offset, name.c_str(), gui->GetSourceFile() );
+			return false;
+		}
+	}
+	for ( c = 0; c < children.Num(); c++ ) {
+		if ( children[c] == NULL ) {
+			common->Error( "idWindow::FixupTransitions: window '%s' in gui '%s' has a NULL child at index %d",
+				name.c_str(), gui->GetSourceFile(), c );
+			return false;
+		}
+		if ( !children[c]->FixupTransitions( fieldIndexes ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+
+/*
+===============
+idWindow::AddChild
+===============
+*/
+void idWindow::AddChild(idWindow *win) {
+	if ( win == NULL ) {
+		return;
+	}
+	win->SetParent( this );
+	win->childID = children.Append(win);
+}
+
+/*
+================
+idWindow::FixupParms
+================
+*/
+void idWindow::FixupParms() {
+	int i;
+	int c = children.Num();
+	for (i = 0; i < c; i++) {
+		children[i]->FixupParms();
+	}
+	for (i = 0; i < SCRIPT_COUNT; i++) {
+		if (scripts[i]) {
+			scripts[i]->FixupParms(this);
+		}
+	}
+
+	c = timeLineEvents.Num();
+	for (i = 0; i < c; i++) {
+		timeLineEvents[i]->event->FixupParms(this);
+	}
+
+	c = namedEvents.Num();
+	for (i = 0; i < c; i++) {
+		namedEvents[i]->mEvent->FixupParms(this);
+	}
+
+	c = numOps;
+	for (i = 0; i < c; i++) {
+		if (ops[i].b == -2) {
+			// need to fix this up
+			const char *p = (const char*)(ops[i].a);
+			idWinVar *var = GetWinVarByName(p, true);
+			UI_LegacyObservationFixup(this,i,p,var);
+			delete []p;
+			ops[i].a = (intptr_t)var;
+			ops[i].b = -1;
+			UI_LegacyObservationResolved(this,i,ops[i].a,ops[i].b);
+		}
+	}
+	
+	
+	if (flags & WIN_DESKTOP) {
+		CalcRects(0,0);
+	}
+	UI_LegacyObservationFixed(this);
+
+}
+
+/*
+================
+idWindow::IsSimple
+================
+*/
+bool idWindow::IsSimple() {
+	// Quake 4 GUI scripts frequently animate per-component aliases such as
+	// "forecolor_w" and "matcolor_w" on otherwise simple leaf windows.  The
+	// compact idSimpleWindow path does not expose the full idWindow alias
+	// surface, so keep retail-style GUI semantics for all windows.
+	return false;
+}
+
+/*
+================
+idWindow::UsesSimpleWindowClipBehavior
+================
+*/
+bool idWindow::UsesSimpleWindowClipBehavior() const {
+	// Keep full idWindow instances for alias lookup while preserving retail's
+	// simple-window drawing behavior: simple leaves do not push a child clip.
+#ifdef ID_ALLOW_TOOLS
+	if ( com_editors & EDITOR_GUI ) {
+		return false;
+	}
+#endif
+	if ( numOps ) {
+		return false;
+	}
+	if ( flags & ( WIN_HCENTER | WIN_VCENTER ) ) {
+		return false;
+	}
+	if ( children.Num() || drawWindows.Num() ) {
+		return false;
+	}
+	for ( int i = 0; i < SCRIPT_COUNT; i++ ) {
+		if ( scripts[i] ) {
+			return false;
+		}
+	}
+	if ( timeLineEvents.Num() || namedEvents.Num() ) {
+		return false;
+	}
+	return forceAspectWidth == 640.0f && forceAspectHeight == 480.0f;
+}
+
+/*
+================
+idWindow::ContainsStateVars
+================
+*/
+bool idWindow::ContainsStateVars() {
+	if ( updateVars.Num() ) {
+		return true;
+	}
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		if ( children[i]->ContainsStateVars() ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+================
+idWindow::Interactive
+================
+*/
+bool idWindow::Interactive() {
+	if ( scripts[ ON_ACTION ] ) {
+		return true;
+	}
+	int c = children.Num();
+	for (int i = 0; i < c; i++) {
+		if (children[i]->Interactive()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+================
+idWindow::SetChildWinVarVal
+================
+*/
+void idWindow::SetChildWinVarVal(const char *name, const char *var, const char *val) {
+	drawWin_t *dw = FindChildByName(name);
+	idWinVar *wv = NULL;
+	if (dw && dw->simp) {
+		wv = dw->simp->GetWinVarByName(var);
+	} else if (dw && dw->win) {
+		wv = dw->win->GetWinVarByName(var);
+	}
+	if (wv) {
+		wv->Set(val);
+		wv->SetEval(false);
+	}
+}
+
+
+/*
+================
+idWindow::FindChildByPoint
+
+Finds the window under the given point
+================
+*/
+idWindow* idWindow::FindChildByPoint ( float x, float y, idWindow** below ) {
+	int c = children.Num();
+
+	// If we are looking for a window below this one then
+	// the next window should be good, but this one wasnt it
+	if ( *below == this ) {
+		*below = NULL;
+		return NULL;
+	}
+
+	if ( !Contains ( drawRect, x, y ) ) {
+		return NULL;
+	}
+		
+	for (int i = c - 1; i >= 0 ; i-- ) {
+		idWindow* found = children[i]->FindChildByPoint ( x, y, below );
+		if ( found ) {
+			if ( *below ) {
+				continue;
+			}
+			
+			return found;
+		}									
+	}
+
+	return this;
+}
+
+/*
+================
+idWindow::FindChildByPoint
+================
+*/
+idWindow* idWindow::FindChildByPoint ( float x, float y, idWindow* below )
+{
+	return FindChildByPoint ( x, y, &below );
+}
+
+/*
+================
+idWindow::GetChildCount
+
+Returns the number of children
+================
+*/
+int idWindow::GetChildCount ( void )
+{
+	return drawWindows.Num ( );
+}
+
+/*
+================
+idWindow::GetChild
+
+Returns the child window at the given index
+================
+*/
+idWindow* idWindow::GetChild ( int index )
+{
+	return drawWindows[index].win;
+}
+
+/*
+================
+idWindow::GetChildIndex
+
+Returns the index of the given child window
+================
+*/
+int idWindow::GetChildIndex ( idWindow* window ) {
+	int find;
+	for ( find = 0; find < drawWindows.Num(); find ++ ) {
+		if ( drawWindows[find].win == window ) {
+			return find;
+		}
+	}
+	return -1;
+}
+
+/*
+================
+idWindow::RemoveChild
+
+Removes the child from the list of children.   Note that the child window being
+removed must still be deallocated by the caller
+================
+*/
+void idWindow::RemoveChild ( idWindow *win ) {
+	int find;
+
+	// Remove the child window
+	children.Remove ( win );
+	
+	for ( find = 0; find < drawWindows.Num(); find ++ )
+	{
+		if ( drawWindows[find].win == win )
+		{
+			drawWindows.RemoveIndex ( find );
+			break;
+		}
+	}
+}
+
+/*
+================
+idWindow::InsertChild
+
+Inserts the given window as a child into the given location in the zorder.
+================
+*/
+bool idWindow::InsertChild ( idWindow *win, idWindow* before )
+{
+	if ( win == NULL ) {
+		return false;
+	}
+
+	AddChild ( win );
+
+	drawWin_t dwt;
+	dwt.simp = NULL;
+	dwt.win = win;
+
+	// If not inserting before anything then just add it at the end
+	if ( before ) {		
+		int index;
+		index = GetChildIndex ( before );
+		if ( index != -1 ) {
+			drawWindows.Insert ( dwt, index );
+			return true;
+		}
+	}
+	
+	drawWindows.Append ( dwt );
+	return true;
+}
+
+/*
+================
+idWindow::ScreenToClient
+================
+*/
+void idWindow::ScreenToClient ( idRectangle* r ) {
+	int		  x;
+	int		  y;
+	idWindow* p;
+	
+	for ( p = this, x = 0, y = 0; p; p = p->parent ) {
+		x += p->rect.x();
+		y += p->rect.y();
+	}
+	
+	r->x -= x;
+	r->y -= y;
+}
+
+/*
+================
+idWindow::ClientToScreen
+================
+*/
+void idWindow::ClientToScreen ( idRectangle* r ) {
+	int		  x;
+	int		  y;
+	idWindow* p;
+	
+	for ( p = this, x = 0, y = 0; p; p = p->parent ) {
+		x += p->rect.x();
+		y += p->rect.y();
+	}
+	
+	r->x += x;
+	r->y += y;	
+}
+
+/*
+================
+idWindow::SetDefaults
+
+Set the window do a default window with no text, no background and 
+default colors, etc..
+================
+*/
+void idWindow::SetDefaults ( void ) {	
+	forceAspectWidth = 640.0f;
+	forceAspectHeight = 480.0f;
+	matScalex = 1;
+	matScaley = 1;
+	borderSize = 0;
+	noTime = false;
+	visible = true;
+	textAlign = 0;
+	textAlignx = 0;
+	textAligny = 0;
+	screenAlignX = SCREEN_ALIGN_X_MIDDLE;
+	screenAlignY = SCREEN_ALIGN_Y_MIDDLE;
+	noEvents = false;
+	rotate = 0;
+	shear.Zero();
+	textScale = 0.35f;
+	textspacing = 0.0f;
+	textstyle = 0.0f;
+	backColor.Zero();
+	foreColor = idVec4(1, 1, 1, 1);
+	hoverColor = idVec4(1, 1, 1, 1);
+	matColor = idVec4(1, 1, 1, 1);
+	borderColor.Zero();
+	text = "";	
+
+	background = NULL;
+	backGroundName = "";
+}
+
+/*
+================
+idWindow::UpdateFromDictionary
+
+The editor only has a dictionary to work with so the easiest way to push the
+values of the dictionary onto the window is for the window to interpret the 
+dictionary as if were a file being parsed.
+================
+*/
+bool idWindow::UpdateFromDictionary ( idDict& dict ) {
+	const idKeyValue*	kv;
+	int					i;
+	
+	SetDefaults ( );
+	
+	// Clear all registers since they will get recreated
+	regList.Reset ( );
+	expressionRegisters.Clear ( );
+	ops.clear();
+	numOps = 0;
+	
+	for ( i = 0; i < dict.GetNumKeyVals(); i ++ ) {
+		kv = dict.GetKeyVal ( i );
+
+		// Special case name
+		if ( !kv->GetKey().Icmp ( "name" ) ) {
+			name = kv->GetValue();
+			continue;
+		}
+
+		idParser src( kv->GetValue().c_str(), kv->GetValue().Length(), "",
+					  LEXFL_NOFATALERRORS | LEXFL_NOSTRINGCONCAT | LEXFL_ALLOWMULTICHARLITERALS | LEXFL_ALLOWBACKSLASHSTRINGCONCAT );
+		if ( !ParseInternalVar ( kv->GetKey(), &src ) ) {
+			// Kill the old register since the parse reg entry will add a new one
+			if ( !ParseRegEntry ( kv->GetKey(), &src ) ) {
+				continue;
+			}
+		}
+	}
+			
+	EvalRegs(-1, true);
+
+	SetupFromState();
+	PostParse();
+	
+	return true;
+}

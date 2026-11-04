@@ -1,0 +1,211 @@
+// Copyright (C) 2004 Id Software, Inc.
+//
+
+#ifndef __USERINTERFACE_H__
+#define __USERINTERFACE_H__
+
+struct wrapInfo_t {
+	int lastWhitespace;
+	int maxIndex;
+	wrapInfo_t ( void ) {
+		lastWhitespace = -1;
+		maxIndex = -1;
+	}
+};
+
+/*
+===============================================================================
+
+	Draws an interactive 2D surface.
+	Used for all user interaction with the game.
+
+===============================================================================
+*/
+
+class idFile;
+class idDemoFile;
+
+
+class idUserInterface {
+public:
+	virtual						~idUserInterface( void ) {}
+
+								// Returns the name of the gui.
+	virtual const char *		Name( void ) const = 0;
+
+								// Returns a comment on the gui.
+	virtual const char *		Comment( void ) const = 0;
+
+								// Returns true if the gui is interactive.
+	virtual bool				IsInteractive() const = 0;
+
+// RAVEN BEGIN
+// bdube: added
+								// Changes the interactive of the gui
+	virtual void				SetInteractive ( bool interactive ) = 0 ;
+// RAVEN END
+
+	virtual bool				IsUniqued() const = 0;
+
+	virtual void				SetUniqued( bool b ) = 0;
+								// returns false if it failed to load
+	virtual bool				InitFromFile( const char *qpath, bool rebuild = true, bool cache = true ) = 0;
+
+								// handles an event, can return an action string, the caller interprets
+								// any return and acts accordingly
+	virtual const char *		HandleEvent( const sysEvent_t *event, int time, bool *updateVisuals = NULL ) = 0;
+
+								// handles a named event
+	virtual void				HandleNamedEvent( const char *eventName ) = 0;
+
+								// repaints the ui
+	virtual void				Redraw( int time, bool useAspectCorrection = true ) = 0;
+
+								// repaints the cursor
+	virtual void				DrawCursor( void ) = 0;
+
+								// Provides read access to the idDict that holds this gui's state.
+	virtual const idDict &		State( void ) const = 0;
+
+								// Removes a gui state variable
+	virtual void				DeleteStateVar( const char *varName ) = 0;
+
+								// Sets a gui state variable.
+	virtual void				SetStateString( const char *varName, const char *value ) = 0;
+	virtual void				SetStateBool( const char *varName, const bool value ) = 0;
+	virtual void				SetStateInt( const char *varName, const int value ) = 0;
+	virtual void				SetStateFloat( const char *varName, const float value ) = 0;
+	//virtual void				SetStateVector( const char *varName, const idVec3& vector ) = 0;
+	virtual void				SetStateVec4( const char *varName, const idVec4& vector ) { }
+
+//	virtual void				DeleteState( const char *varName ) = 0;
+
+	virtual idVec4				GetLightColor(void) { idVec4 zero; zero.Zero(); return zero; }
+
+								// Gets a gui state variable
+	virtual const char*			GetStateString( const char *varName, const char* defaultString = "" ) const = 0;
+	virtual bool				GetStateBool( const char *varName, const char* defaultString = "0" ) const  = 0;
+	virtual int					GetStateInt( const char *varName, const char* defaultString = "0" ) const = 0;
+	virtual float				GetStateFloat( const char *varName, const char* defaultString = "0" ) const = 0;
+//	virtual idVec3				GetStateVector( const char *varName, const char* defaultString = "0 0 0" ) const = 0;
+//	virtual idVec4				GetStateVec4( const char *varName, const char* defaultString = "0 0 0 0" ) const = 0;
+
+	// Presentation values are distinct from the application State() dictionary.
+	// Names are document-owned aliases (legacy: root variable or element::variable).
+	// Queries copy the value without changing expression ownership. Failure leaves
+	// the output untouched. Missing names never create variables or elements.
+	virtual bool                GetPresentationValue( const char *name, idStr &value ) const = 0;
+	// Explicit overrides stop the expression driving this value. A transient write
+	// keeps its existing expression; StateChanged/Redraw remain the caller's choice.
+	virtual bool                SetPresentationValue( const char *name, const char *value, bool overrideExpression = true ) = 0;
+	// Focused editable field/caret in the GUI's cursor coordinate space. False means
+	// there is no editable focus; outputs remain unchanged. No window pointer escapes.
+	virtual bool                GetTextInputState( class idRectangle &area, float &cursorOffset ) const = 0;
+
+								// The state has changed and the gui needs to update from the state idDict.
+	virtual void				StateChanged( int time, bool redraw = false ) = 0;
+
+								// Activated the gui.
+	virtual const char *		Activate( bool activate, int time ) = 0;
+
+								// Triggers the gui and runs the onTrigger scripts.
+	virtual void				Trigger( int time ) = 0;
+
+//	virtual	void				ReadFromDemo( class idDemoFile *f ) = 0;
+//	virtual	void				WriteToDemo( class idDemoFile *f ) = 0;
+
+	virtual bool				WriteToSaveGame( idFile *savefile ) const = 0;
+	virtual bool				ReadFromSaveGame( idFile *savefile ) = 0;
+	virtual void				SetKeyBindingNames( void ) = 0;
+
+	virtual void				SetCursor( float x, float y ) = 0;
+	virtual float				CursorX( void ) = 0;
+	virtual float				CursorY( void ) = 0;
+	virtual bool				GetMaxTextIndex( const char *windowName, const char *text, wrapInfo_t& wrapInfo ) const = 0;
+
+	// Restores a save written with an earlier definition of this GUI. A private
+	// parse of layoutPath consumes the saved window tree; the state dictionary,
+	// interaction flags, cursor, and every window value the save changed from that
+	// definition, together with whether it still follows its expression, move to
+	// this GUI where a same-named window and variable exist.
+	// Appended last so the vtable slots above stay where earlier modules expect.
+	virtual bool				ReadFromSaveGameWithLayout( idFile *savefile, const char *layoutPath, int &restoredWindowValues ) { restoredWindowValues = 0; return false; }
+};
+
+
+// Evaluated game-owned HUD geometry, in the same 640x480 submission space as
+// DrawStretchPic. The UI renderer owns presentation, never gameplay or input.
+class idMaterial;
+struct uiHudPrimitive_t {
+	idVec2 points[4];
+	idVec4 uv;
+	idVec4 color;
+	const idMaterial* material;
+	bool glyph;
+};
+
+class idUserInterfaceManager {
+public:
+	virtual						~idUserInterfaceManager( void ) {}
+
+	virtual void				Init( void ) = 0;
+	virtual void				Shutdown( void ) = 0;
+	virtual void				Touch( const char *name ) = 0;
+	virtual void				WritePrecacheCommands( idFile *f ) = 0;
+
+								// Sets the size for 640x480 adjustment.
+	virtual void				SetSize( float width, float height ) = 0;
+
+	virtual void				BeginLevelLoad( void ) = 0;
+	virtual void				EndLevelLoad( void ) = 0;
+	virtual bool DrawHudPrimitives( const char* source, const idList<uiHudPrimitive_t>& items ) { return false; }
+
+
+								// Reloads changed guis, or all guis.
+	virtual void				Reload( bool all ) = 0;
+
+								// lists all guis
+	virtual void				ListGuis( void ) const = 0;
+
+								// Returns true if gui exists.
+	virtual bool				CheckGui( const char *qpath ) const = 0;
+
+								// Allocates a new gui.
+	virtual idUserInterface *	Alloc( void ) const = 0;
+
+								// De-allocates a gui.. ONLY USE FOR PRECACHING
+	virtual void				DeAlloc( idUserInterface *gui ) = 0;
+
+								// Returns NULL if gui by that name does not exist.
+	virtual idUserInterface *	FindGui( const char *qpath, bool autoLoad = false, bool needUnique = false, bool forceUnique = false ) = 0;
+
+								// Returns the index into the global gui list
+//	virtual int					GuiIndex( idUserInterface *gui ) = 0;
+
+								// Returns the gui at location index, or allocates a new one at location index
+//	virtual idUserInterface *	FindGuiByIndex( int index ) = 0;
+
+								// Clears out the in game guis before loading a renderdemo
+//	virtual void				ClearGameGuis( void ) = 0;
+
+								// Allocates a new GUI list handler
+	virtual	idListGUI *			AllocListGUI( void ) const = 0;
+
+								// De-allocates a list gui
+	virtual void				FreeListGUI( idListGUI *listgui ) = 0;
+	
+// RAVEN BEGIN
+// rjohnson: added option for guis to always think
+	virtual void				RunAlwaysThinkGUIs ( int time ) = 0;
+//// bdube: embedded icons
+	virtual void				RegisterIcon ( const char* code, const char* shader, int x = -1, int y = -1, int w = -1, int h = -1 ) { }
+// RAVEN END
+	// Shape localized game-owned HUD text with the UI's current language/font
+	// policy. Returned quads are local to the supplied box, centered in white.
+	virtual void BuildHudText( const char* text, float scale, float width, float height,
+		idList<uiHudPrimitive_t>& output ) { output.Clear(); }
+};
+
+extern idUserInterfaceManager *	uiManager;
+
+#endif /* !__USERINTERFACE_H__ */
